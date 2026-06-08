@@ -5,6 +5,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:glamar/app/theme/glamar_theme.dart';
+import 'package:glamar/features/face_mesh/painters/lipstick_painter.dart';
 import 'package:glamar/features/face_mesh/utils/face_mesh_camera_image_adapter.dart';
 import 'package:mediapipe_face_mesh/face_mesh_painter.dart';
 import 'package:mediapipe_face_mesh/mediapipe_face_mesh.dart';
@@ -43,6 +44,15 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   bool _showSkeleton = true;
   double _inferenceFps = 0;
   String _statusMessage = '正在启动相机...';
+
+  // 口红状态
+  Color? _lipstickColor = const Color(0xFFCC2929);
+
+  // EMA 平滑后的关键点坐标（归一化 [0,1]）
+  List<Offset>? _smoothedLandmarks;
+
+  /// EMA 平滑系数：越大越跟手，越小越平滑（0.6 ~ 0.8 适合追踪优先场景）
+  static const double _smoothingAlpha = 0.7;
 
   DateTime? _lastInferenceTime;
   DateTime? _lastFpsUpdate;
@@ -231,10 +241,34 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     if (!mounted) {
       return;
     }
+    _applySmoothing(mesh);
     setState(() {
       _meshResult = mesh;
       _landmarkCount = mesh?.landmarks.length ?? 0;
     });
+  }
+
+  void _applySmoothing(FaceMeshResult? mesh) {
+    if (mesh == null) {
+      _smoothedLandmarks = null;
+      return;
+    }
+    final raw = mesh.landmarks;
+    final prev = _smoothedLandmarks;
+
+    if (prev == null || prev.length != raw.length) {
+      // 首帧直接使用原始坐标
+      _smoothedLandmarks = [for (final lm in raw) Offset(lm.x, lm.y)];
+      return;
+    }
+
+    // EMA: smoothed = alpha * new + (1 - alpha) * prev
+    const a = _smoothingAlpha;
+    const b = 1.0 - a;
+    _smoothedLandmarks = [
+      for (int i = 0; i < raw.length; i++)
+        Offset(a * raw[i].x + b * prev[i].dx, a * raw[i].y + b * prev[i].dy),
+    ];
   }
 
   void _onInferenceError(Object error) {
@@ -425,6 +459,17 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                           fit: StackFit.expand,
                           children: [
                             CameraPreview(controller),
+                            if (_lipstickColor != null &&
+                                _smoothedLandmarks != null)
+                              RepaintBoundary(
+                                child: CustomPaint(
+                                  painter: LipstickPainter(
+                                    landmarks: _smoothedLandmarks!,
+                                    color: _lipstickColor!,
+                                    mirrorHorizontal: _mirrorHorizontal,
+                                  ),
+                                ),
+                              ),
                             if (_showSkeleton && _meshResult != null)
                               RepaintBoundary(
                                 child: CustomPaint(
@@ -454,6 +499,10 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
           ),
         ),
         _TopBar(onBack: () => Navigator.of(context).pop()),
+        _LipstickPalette(
+          selected: _lipstickColor,
+          onSelect: (color) => setState(() => _lipstickColor = color),
+        ),
         _BottomHud(
           landmarkCount: _landmarkCount,
           fps: _inferenceFps,
@@ -726,6 +775,123 @@ class _HintChip extends StatelessWidget {
           color: GlamARColors.champagne.withValues(alpha: 0.8),
           fontSize: 11,
           letterSpacing: 0.6,
+        ),
+      ),
+    );
+  }
+}
+
+class _LipstickPalette extends StatelessWidget {
+  const _LipstickPalette({
+    required this.selected,
+    required this.onSelect,
+  });
+
+  final Color? selected;
+  final ValueChanged<Color?> onSelect;
+
+  static const List<({Color color, String label})> _presets = [
+    (color: Color(0xFFCC2929), label: '红'),
+    (color: Color(0xFFD4607A), label: '玫'),
+    (color: Color(0xFFB87060), label: '裸'),
+    (color: Color(0xFF8B2252), label: '莓'),
+    (color: Color(0xFFE8634F), label: '珊'),
+    (color: Color(0xFF7B2D4E), label: '紫'),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned(
+      left: 16,
+      right: 16,
+      bottom: 104,
+      child: SafeArea(
+        top: false,
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.45),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(
+              color: GlamARColors.champagne.withValues(alpha: 0.12),
+            ),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            child: Row(
+              children: [
+                Text(
+                  '口红',
+                  style: TextStyle(
+                    color: GlamARColors.champagne.withValues(alpha: 0.6),
+                    fontSize: 11,
+                    letterSpacing: 0.8,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: _presets.map((preset) {
+                      final isSelected = selected == preset.color;
+                      return GestureDetector(
+                        onTap: () => onSelect(
+                          isSelected ? null : preset.color,
+                        ),
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 180),
+                          width: 32,
+                          height: 32,
+                          decoration: BoxDecoration(
+                            color: preset.color,
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: isSelected
+                                  ? Colors.white
+                                  : Colors.transparent,
+                              width: 2.5,
+                            ),
+                            boxShadow: isSelected
+                                ? [
+                                    BoxShadow(
+                                      color: preset.color.withValues(alpha: 0.6),
+                                      blurRadius: 8,
+                                      spreadRadius: 1,
+                                    ),
+                                  ]
+                                : null,
+                          ),
+                        ),
+                      );
+                    }).toList(),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                // 清除按钮
+                GestureDetector(
+                  onTap: () => onSelect(null),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 180),
+                    width: 32,
+                    height: 32,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: selected == null
+                            ? Colors.white
+                            : Colors.white30,
+                        width: 2,
+                      ),
+                    ),
+                    child: Icon(
+                      Icons.close,
+                      size: 16,
+                      color: selected == null ? Colors.white : Colors.white38,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
