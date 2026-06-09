@@ -1,11 +1,32 @@
-import 'dart:typed_data';
-
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
+import 'package:glamar/features/face_mesh/utils/nv21_isolate_converter.dart';
 import 'package:mediapipe_face_mesh/mediapipe_face_mesh.dart';
 
 /// 将 `camera` 帧转换为 mediapipe_face_mesh 输入格式。
 class FaceMeshCameraImageAdapter {
   const FaceMeshCameraImageAdapter._();
+
+  /// Android 三平面 YUV 在后台 Isolate 转换，避免阻塞 UI。
+  static Future<FaceMeshNv21Image?> toNv21Async(CameraImage image) async {
+    final planes = image.planes;
+    if (planes.length >= 3) {
+      final request = Nv21ConvertRequest(
+        width: image.width,
+        height: image.height,
+        yPlane: Uint8List.fromList(planes[0].bytes),
+        yBytesPerRow: planes[0].bytesPerRow,
+        uPlane: Uint8List.fromList(planes[1].bytes),
+        uBytesPerRow: planes[1].bytesPerRow,
+        uPixelStride: planes[1].bytesPerPixel ?? 1,
+        vPlane: Uint8List.fromList(planes[2].bytes),
+        vBytesPerRow: planes[2].bytesPerRow,
+        vPixelStride: planes[2].bytesPerPixel ?? 1,
+      );
+      return compute(convertNv21InIsolate, request);
+    }
+    return toNv21(image);
+  }
 
   static FaceMeshNv21Image? toNv21(CameraImage image) {
     final planes = image.planes;

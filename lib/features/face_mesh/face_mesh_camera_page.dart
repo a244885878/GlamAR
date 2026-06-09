@@ -7,6 +7,8 @@ import 'package:flutter/services.dart';
 import 'package:glamar/app/theme/glamar_theme.dart';
 import 'package:glamar/features/face_mesh/painters/lipstick_painter.dart';
 import 'package:glamar/features/face_mesh/utils/face_mesh_camera_image_adapter.dart';
+import 'package:glamar/features/face_mesh/utils/landmark_smoother.dart';
+import 'package:glamar/features/face_mesh/utils/lip_landmark_indices.dart';
 import 'package:mediapipe_face_mesh/face_mesh_painter.dart';
 import 'package:mediapipe_face_mesh/mediapipe_face_mesh.dart';
 class FaceMeshCameraPage extends StatefulWidget {
@@ -40,22 +42,28 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   String? _errorMessage;
   bool _isInitializing = true;
   bool _isModelReady = false;
-  bool _isProcessingFrame = false;
+  bool _inferBusy = false;
+  CameraImage? _pendingCameraImage;
   bool _showSkeleton = true;
   double _inferenceFps = 0;
   String _statusMessage = '正在启动相机...';
+  Size _paintSize = Size.zero;
 
   // 口红状态
   Color? _lipstickColor = const Color(0xFFCC2929);
+  final ValueNotifier<List<Offset>?> _lipstickLandmarks =
+      ValueNotifier<List<Offset>?>(null);
+  late final LipLandmarkSmoother _lipSmoother = LipLandmarkSmoother(
+    alpha: Platform.isAndroid ? 0.95 : 0.75,
+    lipIndices: LipLandmarkIndices.all,
+  );
 
-  // EMA 平滑后的关键点坐标（归一化 [0,1]）
-  List<Offset>? _smoothedLandmarks;
-
-  /// EMA 平滑系数：越大越跟手，越小越平滑（0.6 ~ 0.8 适合追踪优先场景）
-  static const double _smoothingAlpha = 0.7;
+  /// 库默认 0.5。Android 略提高：跟踪置信度不足时更快触发重检测，转头更跟手。
+  double get _meshMinTrackingConfidence => Platform.isAndroid ? 0.65 : 0.5;
 
   DateTime? _lastInferenceTime;
   DateTime? _lastFpsUpdate;
+  DateTime? _lastHudUpdate;
 
   @override
   void initState() {
@@ -149,9 +157,12 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     return _createWithDelegateFallback(
       (delegate) => FaceMeshProcessor.create(
         delegate: delegate,
-        enableSmoothing: true,
+        minTrackingConfidence: _meshMinTrackingConfidence,
+        // Android 关闭内置平滑，避免与嘴唇 EMA 叠加产生拖影
+        enableSmoothing: !Platform.isAndroid,
         enableRoiTracking: true,
-        enableIris: true,
+        // 口红场景不需要虹膜点，Android 上可省一帧推理
+        enableIris: !Platform.isAndroid,
       ),
     );
   }
@@ -160,10 +171,10 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     Future<T> Function(FaceMeshDelegate delegate) create,
   ) async {
     const timeout = Duration(seconds: 20);
-    for (final delegate in [
-      FaceMeshDelegate.cpu,
-      FaceMeshDelegate.xnnpack,
-    ]) {
+    final delegates = Platform.isAndroid
+        ? [FaceMeshDelegate.xnnpack, FaceMeshDelegate.cpu]
+        : [FaceMeshDelegate.cpu, FaceMeshDelegate.xnnpack];
+    for (final delegate in delegates) {
       try {
         return await create(delegate).timeout(timeout);
       } on TimeoutException {
@@ -176,7 +187,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   Future<void> _startCamera(CameraDescription camera) async {
     final controller = CameraController(
       camera,
-      ResolutionPreset.high,
+      // Android 降低采集分辨率，减轻 NV21 转换与推理压力
+      Platform.isAndroid ? ResolutionPreset.medium : ResolutionPreset.high,
       enableAudio: false,
       imageFormatGroup: Platform.isIOS
           ? ImageFormatGroup.bgra8888
@@ -234,48 +246,55 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   }
 
   void _onInferenceResult(FaceMeshInferenceResult result) {
-    _isProcessingFrame = false;
+    _inferBusy = false;
     _updateInferenceFps();
 
     final mesh = result.meshResult;
-    if (!mounted) {
-      return;
-    }
-    _applySmoothing(mesh);
-    setState(() {
+    _updateTrackedLandmarks(mesh);
+
+    final now = DateTime.now();
+    final shouldRefreshHud = _lastHudUpdate == null ||
+        now.difference(_lastHudUpdate!) >= const Duration(milliseconds: 250);
+
+    final refreshSkeleton = _showSkeleton && mesh != null;
+    if (mounted && (shouldRefreshHud || refreshSkeleton)) {
+      if (shouldRefreshHud) {
+        _lastHudUpdate = now;
+      }
+      setState(() {
+        _meshResult = mesh;
+        _landmarkCount = mesh?.landmarks.length ?? 0;
+      });
+    } else {
       _meshResult = mesh;
       _landmarkCount = mesh?.landmarks.length ?? 0;
-    });
+    }
+
+    unawaited(_processLatestFrame());
   }
 
-  void _applySmoothing(FaceMeshResult? mesh) {
-    if (mesh == null) {
-      _smoothedLandmarks = null;
-      return;
-    }
-    final raw = mesh.landmarks;
-    final prev = _smoothedLandmarks;
-
-    if (prev == null || prev.length != raw.length) {
-      // 首帧直接使用原始坐标
-      _smoothedLandmarks = [for (final lm in raw) Offset(lm.x, lm.y)];
+  void _updateTrackedLandmarks(FaceMeshResult? mesh) {
+    if (mesh == null || _paintSize == Size.zero) {
+      _lipSmoother.reset();
+      _lipstickLandmarks.value = null;
       return;
     }
 
-    // EMA: smoothed = alpha * new + (1 - alpha) * prev
-    const a = _smoothingAlpha;
-    const b = 1.0 - a;
-    _smoothedLandmarks = [
-      for (int i = 0; i < raw.length; i++)
-        Offset(a * raw[i].x + b * prev[i].dx, a * raw[i].y + b * prev[i].dy),
-    ];
+    final pixels = _lipSmoother.smoothToPixelOffsets(
+      mesh: mesh,
+      targetSize: _paintSize,
+      rotationDegrees: 0,
+      mirrorHorizontal: _mirrorHorizontal,
+    );
+    _lipstickLandmarks.value = pixels;
   }
 
   void _onInferenceError(Object error) {
-    _isProcessingFrame = false;
+    _inferBusy = false;
     if (mounted) {
       setState(() => _errorMessage ??= '$error');
     }
+    unawaited(_processLatestFrame());
   }
 
   void _updateInferenceFps() {
@@ -298,11 +317,20 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   }
 
   void _onCameraFrame(CameraImage image) {
-    if (_isProcessingFrame || !_isModelReady || _streamProcessor == null) {
+    if (!_isModelReady || _streamProcessor == null) {
       return;
     }
+    _pendingCameraImage = image;
+    unawaited(_processLatestFrame());
+  }
+
+  Future<void> _processLatestFrame() async {
+    if (_inferBusy || !_isModelReady || _streamProcessor == null) {
+      return;
+    }
+    final image = _pendingCameraImage;
     final controller = _cameraController;
-    if (controller == null || !controller.value.isInitialized) {
+    if (image == null || controller == null || !controller.value.isInitialized) {
       return;
     }
 
@@ -311,30 +339,44 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       return;
     }
 
-    if (Platform.isAndroid) {
-      final nv21 = FaceMeshCameraImageAdapter.toNv21(image);
-      if (nv21 == null) {
-        return;
+    _pendingCameraImage = null;
+    _inferBusy = true;
+
+    try {
+      if (Platform.isAndroid) {
+        final nv21 = await FaceMeshCameraImageAdapter.toNv21Async(image);
+        if (nv21 == null) {
+          _inferBusy = false;
+          return;
+        }
+        _ensureInferenceStream(rotation);
+        final stream = _nv21Controller;
+        if (stream == null || stream.isClosed) {
+          _inferBusy = false;
+          return;
+        }
+        stream.add(nv21);
+      } else if (Platform.isIOS) {
+        final bgra = FaceMeshCameraImageAdapter.toBgra(image);
+        if (bgra == null) {
+          _inferBusy = false;
+          return;
+        }
+        _ensureInferenceStream(rotation);
+        final stream = _bgraController;
+        if (stream == null || stream.isClosed) {
+          _inferBusy = false;
+          return;
+        }
+        stream.add(bgra);
+      } else {
+        _inferBusy = false;
       }
-      _ensureInferenceStream(rotation);
-      final stream = _nv21Controller;
-      if (stream == null || stream.isClosed) {
-        return;
+    } catch (error) {
+      _inferBusy = false;
+      if (mounted) {
+        setState(() => _errorMessage ??= '$error');
       }
-      _isProcessingFrame = true;
-      stream.add(nv21);
-    } else if (Platform.isIOS) {
-      final bgra = FaceMeshCameraImageAdapter.toBgra(image);
-      if (bgra == null) {
-        return;
-      }
-      _ensureInferenceStream(rotation);
-      final stream = _bgraController;
-      if (stream == null || stream.isClosed) {
-        return;
-      }
-      _isProcessingFrame = true;
-      stream.add(bgra);
     }
   }
 
@@ -365,7 +407,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     _nv21Controller = null;
     _bgraController = null;
     _streamRotation = null;
-    _isProcessingFrame = false;
+    _inferBusy = false;
+    _pendingCameraImage = null;
   }
 
   @override
@@ -381,6 +424,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       _isModelReady = false;
       _meshResult = null;
       _landmarkCount = 0;
+      _lipSmoother.reset();
+      _lipstickLandmarks.value = null;
     } else if (state == AppLifecycleState.resumed && _cameraController == null) {
       setState(() {
         _isInitializing = true;
@@ -397,6 +442,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     _cameraController?.dispose();
     _detector?.close();
     _meshProcessor?.close();
+    _lipstickLandmarks.dispose();
     super.dispose();
   }
 
@@ -444,6 +490,12 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
           child: LayoutBuilder(
             builder: (context, constraints) {
               final width = constraints.maxWidth;
+              final paintHeight = width / nativeAspect;
+              final paintSize = Size(width, paintHeight);
+              if (_paintSize != paintSize) {
+                _paintSize = paintSize;
+                _updateTrackedLandmarks(_meshResult);
+              }
               return SizedBox(
                 width: width,
                 child: AspectRatio(
@@ -454,20 +506,27 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                       alignment: Alignment.center,
                       child: SizedBox(
                         width: width,
-                        height: width / nativeAspect,
+                        height: paintHeight,
                         child: Stack(
                           fit: StackFit.expand,
                           children: [
                             CameraPreview(controller),
-                            if (_lipstickColor != null &&
-                                _smoothedLandmarks != null)
+                            if (_lipstickColor != null)
                               RepaintBoundary(
-                                child: CustomPaint(
-                                  painter: LipstickPainter(
-                                    landmarks: _smoothedLandmarks!,
-                                    color: _lipstickColor!,
-                                    mirrorHorizontal: _mirrorHorizontal,
-                                  ),
+                                child: ListenableBuilder(
+                                  listenable: _lipstickLandmarks,
+                                  builder: (context, _) {
+                                    final pixels = _lipstickLandmarks.value;
+                                    if (pixels == null) {
+                                      return const SizedBox.shrink();
+                                    }
+                                    return CustomPaint(
+                                      painter: LipstickPainter(
+                                        landmarkPixels: pixels,
+                                        color: _lipstickColor!,
+                                      ),
+                                    );
+                                  },
                                 ),
                               ),
                             if (_showSkeleton && _meshResult != null)
@@ -483,8 +542,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                                     irisColor: GlamARColors.meshIris,
                                     refinedEyeColor: GlamARColors.rose,
                                     strokeWidth: 0.35,
-                                    drawIris: true,
-                                    drawRefinedEyeEdges: true,
+                                    drawIris: !Platform.isAndroid,
+                                    drawRefinedEyeEdges: !Platform.isAndroid,
                                   ),
                                 ),
                               ),
