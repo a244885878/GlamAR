@@ -1,31 +1,52 @@
 import 'dart:math' as math;
-import 'dart:ui';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:glamar/features/face_mesh/models/normalized_face_frame.dart';
 import 'package:glamar/features/face_mesh/utils/adaptive_landmark_smoother.dart';
 import 'package:mediapipe_face_mesh/mediapipe_face_mesh.dart';
 
 void main() {
-  const targetSize = Size(1000, 1000);
-
   test('keeps still landmarks stable', () {
     final smoother = AdaptiveLandmarkSmoother();
     const now = Duration(seconds: 10);
     final mesh = _mesh(shiftX: 0);
     final first = smoother.observe(
       mesh: mesh,
-      targetSize: targetSize,
-      mirrorHorizontal: false,
+      sourceSequence: 1,
       sourceTimestamp: now - const Duration(milliseconds: 32),
     )!;
     final second = smoother.observe(
       mesh: mesh,
-      targetSize: targetSize,
-      mirrorHorizontal: false,
+      sourceSequence: 2,
       sourceTimestamp: now,
     )!;
 
     expect((second[1] - first[1]).distance, lessThan(0.01));
+    expect(second.sourceSequence, 2);
+  });
+
+  test('keeps canonical depth data for the future GPU backend', () {
+    final smoother = AdaptiveLandmarkSmoother();
+    final mesh = _mesh(shiftX: 0);
+    final point = mesh.landmarks[1];
+    mesh.landmarks[1] = FaceMeshLandmark(x: point.x, y: point.y, z: -0.12);
+
+    final frame = smoother.observe(mesh: mesh, sourceSequence: 9)!;
+
+    expect(frame.landmarkCount, 468);
+    expect(frame.xyz.length, 468 * 3);
+    expect(frame.z(1), closeTo(-0.12, 0.0001));
+    expect(frame.sourceSequence, 9);
+  });
+
+  test('uses aspect-correct metrics while preserving normalized output', () {
+    final smoother = AdaptiveLandmarkSmoother();
+    final mesh = _mesh(shiftX: 0, imageWidth: 720, imageHeight: 1280);
+
+    final frame = smoother.observe(mesh: mesh)!;
+
+    expect(frame.x(10), closeTo(mesh.landmarks[10].x, 0.0001));
+    expect(frame.y(10), closeTo(mesh.landmarks[10].y, 0.0001));
   });
 
   test('predicts moving face forward between inference frames', () {
@@ -33,14 +54,10 @@ void main() {
     const now = Duration(seconds: 10);
     smoother.observe(
       mesh: _mesh(shiftX: 0),
-      targetSize: targetSize,
-      mirrorHorizontal: false,
       sourceTimestamp: now - const Duration(milliseconds: 33),
     );
     final observed = smoother.observe(
       mesh: _mesh(shiftX: 0.018),
-      targetSize: targetSize,
-      mirrorHorizontal: false,
       sourceTimestamp: now,
     )!;
     final predicted = smoother.predict(
@@ -55,16 +72,9 @@ void main() {
     const now = Duration(seconds: 10);
     smoother.observe(
       mesh: _mesh(shiftX: 0),
-      targetSize: targetSize,
-      mirrorHorizontal: false,
       sourceTimestamp: now - const Duration(milliseconds: 33),
     );
-    smoother.observe(
-      mesh: _mesh(shiftX: 0.018),
-      targetSize: targetSize,
-      mirrorHorizontal: false,
-      sourceTimestamp: now,
-    );
+    smoother.observe(mesh: _mesh(shiftX: 0.018), sourceTimestamp: now);
 
     final clamped = smoother.predict(
       displayTimestamp: now + const Duration(milliseconds: 96),
@@ -81,14 +91,10 @@ void main() {
     const now = Duration(seconds: 10);
     smoother.observe(
       mesh: _mesh(shiftX: 0, scale: 1),
-      targetSize: targetSize,
-      mirrorHorizontal: false,
       sourceTimestamp: now - const Duration(milliseconds: 33),
     );
     final observed = smoother.observe(
       mesh: _mesh(shiftX: 0, scale: 1.12),
-      targetSize: targetSize,
-      mirrorHorizontal: false,
       sourceTimestamp: now,
     )!;
     final predicted = smoother.predict(
@@ -110,14 +116,10 @@ void main() {
     const now = Duration(seconds: 10);
     final first = smoother.observe(
       mesh: _mesh(shiftX: 0),
-      targetSize: targetSize,
-      mirrorHorizontal: false,
       sourceTimestamp: now - const Duration(milliseconds: 33),
     )!;
     final observed = smoother.observe(
       mesh: _mesh(shiftX: 0, outlierIndex: 50, outlierDx: 0.2),
-      targetSize: targetSize,
-      mirrorHorizontal: false,
       sourceTimestamp: now,
     )!;
 
@@ -131,14 +133,10 @@ void main() {
     const now = Duration(seconds: 10);
     final first = smoother.observe(
       mesh: _mesh(shiftX: 0),
-      targetSize: targetSize,
-      mirrorHorizontal: false,
       sourceTimestamp: now - const Duration(milliseconds: 33),
     )!;
     final observed = smoother.observe(
       mesh: _mesh(shiftX: 0, rotation: 0.16),
-      targetSize: targetSize,
-      mirrorHorizontal: false,
       sourceTimestamp: now,
     )!;
 
@@ -156,10 +154,16 @@ void main() {
   });
 }
 
+extension on NormalizedFaceFrame {
+  Offset operator [](int index) => Offset(x(index) * 1000, y(index) * 1000);
+}
+
 FaceMeshResult _mesh({
   required double shiftX,
   double scale = 1,
   double rotation = 0,
+  int imageWidth = 1000,
+  int imageHeight = 1000,
   int? outlierIndex,
   double outlierDx = 0,
 }) {
@@ -211,7 +215,7 @@ FaceMeshResult _mesh({
       height: 0.7 * scale,
     ),
     score: 0.99,
-    imageWidth: 1000,
-    imageHeight: 1000,
+    imageWidth: imageWidth,
+    imageHeight: imageHeight,
   );
 }

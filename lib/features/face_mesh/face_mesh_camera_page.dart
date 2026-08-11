@@ -8,6 +8,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
 import 'package:glamar/app/theme/glamar_theme.dart';
+import 'package:glamar/features/face_mesh/models/normalized_face_frame.dart';
 import 'package:glamar/features/face_mesh/utils/adaptive_landmark_smoother.dart';
 import 'package:glamar/features/face_mesh/utils/ar_frame_timeline.dart';
 import 'package:glamar/features/face_mesh/utils/ar_runtime_governor.dart';
@@ -56,8 +57,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   String _statusMessage = '正在启动相机...';
   Size _paintSize = Size.zero;
 
-  final ValueNotifier<List<Offset>?> _makeupLandmarks =
-      ValueNotifier<List<Offset>?>(null);
+  final ValueNotifier<NormalizedFaceFrame?> _trackedFaceFrame =
+      ValueNotifier<NormalizedFaceFrame?>(null);
   final ValueNotifier<_TrackingPerformance> _trackingPerformance =
       ValueNotifier<_TrackingPerformance>(const _TrackingPerformance());
   final ValueNotifier<_OcclusionTexture?> _occlusionTexture =
@@ -218,7 +219,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   void _onInferenceResult(
     FaceMeshResult? mesh, {
     required FaceLighting lighting,
-    required Duration sourceTimestamp,
+    required ArFrameStamp sourceFrame,
     required Duration inferenceDuration,
   }) {
     _consecutiveInferenceErrors = 0;
@@ -230,7 +231,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     }
     _faceLighting = FaceLighting.lerp(_faceLighting, lighting, 0.18);
     if (mesh != null) {
-      _lastValidMeshTimestamp = sourceTimestamp;
+      _lastValidMeshTimestamp = sourceFrame.capturedAt;
       _makeupTrackingOpacity = 1;
       final observedContext = FaceRenderContext.fromMesh(
         mesh,
@@ -245,8 +246,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
             )
           : observedContext;
     }
-    _lastMeshFrameTimestamp = sourceTimestamp;
-    _updateTrackedLandmarks(mesh, sourceTimestamp: sourceTimestamp);
+    _lastMeshFrameTimestamp = sourceFrame.capturedAt;
+    _updateTrackedLandmarks(mesh, sourceFrame: sourceFrame);
     _recordPerformance(inferenceDuration, mesh != null);
 
     if (mounted && hadFace != (_landmarkCount >= 468)) {
@@ -256,28 +257,24 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
 
   void _updateTrackedLandmarks(
     FaceMeshResult? mesh, {
-    Duration? sourceTimestamp,
+    ArFrameStamp? sourceFrame,
   }) {
-    if (_paintSize == Size.zero) {
-      _landmarkSmoother.reset();
-      _makeupLandmarks.value = null;
-      return;
-    }
     if (mesh == null) {
       _updateTrackingBridge(_frameTimeline.now);
       return;
     }
 
-    final pixels = _landmarkSmoother.observe(
+    final frame = _landmarkSmoother.observe(
       mesh: mesh,
-      targetSize: _paintSize,
-      mirrorHorizontal: _mirrorHorizontal,
+      sourceSequence: sourceFrame?.sequence ?? 0,
       sourceTimestamp:
-          sourceTimestamp ?? _lastMeshFrameTimestamp ?? _frameTimeline.now,
+          sourceFrame?.capturedAt ??
+          _lastMeshFrameTimestamp ??
+          _frameTimeline.now,
       displayTimestamp: _frameTimeline.renderTimestamp,
       maximumPrediction: _frameTimeline.maximumPredictionHorizon,
     );
-    _makeupLandmarks.value = pixels;
+    _trackedFaceFrame.value = frame;
   }
 
   void _onRenderTick(Duration _) {
@@ -298,7 +295,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       displayTimestamp: renderTimestamp,
       maximumPrediction: _frameTimeline.maximumPredictionHorizon,
     );
-    if (predicted != null) _makeupLandmarks.value = predicted;
+    if (predicted != null) _trackedFaceFrame.value = predicted;
   }
 
   void _updateTrackingBridge(Duration now) {
@@ -317,7 +314,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       displayTimestamp: _frameTimeline.renderTimestamp,
       maximumPrediction: _frameTimeline.maximumPredictionHorizon,
     );
-    if (predicted != null) _makeupLandmarks.value = predicted;
+    if (predicted != null) _trackedFaceFrame.value = predicted;
   }
 
   void _expireTrackingBridge() {
@@ -326,7 +323,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     _lastValidMeshTimestamp = null;
     _landmarkCount = 0;
     _landmarkSmoother.reset();
-    if (_makeupLandmarks.value != null) _makeupLandmarks.value = null;
+    if (_trackedFaceFrame.value != null) _trackedFaceFrame.value = null;
     _clearOcclusionTexture();
     if (hadFace && mounted) setState(() {});
   }
@@ -436,7 +433,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       _onInferenceResult(
         sample.mesh,
         lighting: sample.lighting,
-        sourceTimestamp: pending.stamp.capturedAt,
+        sourceFrame: pending.stamp,
         inferenceDuration: stopwatch.elapsed,
       );
     } catch (error) {
@@ -627,7 +624,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       _makeupTrackingOpacity = 0;
       _frameTimeline.reset();
       _landmarkSmoother.reset();
-      _makeupLandmarks.value = null;
+      _trackedFaceFrame.value = null;
     } else if (state == AppLifecycleState.resumed &&
         _cameraController == null) {
       setState(() {
@@ -649,7 +646,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     unawaited(_occlusionWorker?.close());
     _occlusionWorker = null;
     _clearOcclusionTexture();
-    _makeupLandmarks.dispose();
+    _trackedFaceFrame.dispose();
     _trackingPerformance.dispose();
     _occlusionTexture.dispose();
     super.dispose();
@@ -1037,11 +1034,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
               final width = constraints.maxWidth;
               final paintHeight = width / nativeAspect;
               final paintSize = Size(width, paintHeight);
-              if (_paintSize != paintSize) {
-                _paintSize = paintSize;
-                _landmarkSmoother.reset();
-                _updateTrackedLandmarks(_meshResult);
-              }
+              _paintSize = paintSize;
               return SizedBox(
                 width: width,
                 child: AspectRatio(
@@ -1060,12 +1053,16 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                             if (_makeupVisible)
                               RepaintBoundary(
                                 child: ListenableBuilder(
-                                  listenable: _makeupLandmarks,
+                                  listenable: _trackedFaceFrame,
                                   builder: (context, _) {
-                                    final pixels = _makeupLandmarks.value;
-                                    if (pixels == null) {
+                                    final frame = _trackedFaceFrame.value;
+                                    if (frame == null) {
                                       return const SizedBox.shrink();
                                     }
+                                    final pixels = frame.projectToPixels(
+                                      paintSize,
+                                      mirrorHorizontal: _mirrorHorizontal,
+                                    );
                                     final makeup = Stack(
                                       fit: StackFit.expand,
                                       children: [

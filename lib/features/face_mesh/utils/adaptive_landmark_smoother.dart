@@ -1,6 +1,8 @@
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui';
 
+import 'package:glamar/features/face_mesh/models/normalized_face_frame.dart';
 import 'package:mediapipe_face_mesh/mediapipe_face_mesh.dart';
 
 /// 面向实时 AR 的关键点滤波器。
@@ -13,15 +15,19 @@ class AdaptiveLandmarkSmoother {
 
   final List<Offset> _positions = <Offset>[];
   final List<Offset> _velocities = <Offset>[];
+  Float32List _depths = Float32List(0);
+  Float32List _depthVelocities = Float32List(0);
   final Stopwatch _clock = Stopwatch()..start();
 
   Duration? _lastSourceTimestamp;
+  int _lastSourceSequence = 0;
   Offset _center = Offset.zero;
   Offset _centerVelocity = Offset.zero;
   double _faceScale = 1;
   double _scaleVelocity = 0;
   double _angle = 0;
   double _angularVelocity = 0;
+  double _coordinateAspectRatio = 1;
 
   bool get hasFace => _positions.length >= 468;
 
@@ -35,32 +41,35 @@ class AdaptiveLandmarkSmoother {
   }
 
   /// 接收一帧模型观测，并返回补偿到当前显示时刻的关键点。
-  List<Offset>? observe({
+  NormalizedFaceFrame? observe({
     required FaceMeshResult mesh,
-    required Size targetSize,
-    required bool mirrorHorizontal,
+    int sourceSequence = 0,
     Duration? sourceTimestamp,
     Duration? displayTimestamp,
     Duration maximumPrediction = defaultMaximumPrediction,
   }) {
-    if (mesh.landmarks.length < 468 || targetSize.isEmpty) {
+    if (mesh.landmarks.length < 468) {
       reset();
       return null;
     }
 
     final timestamp = sourceTimestamp ?? _clock.elapsed;
     final displayTime = displayTimestamp ?? _clock.elapsed;
+    final coordinateAspectRatio = mesh.imageWidth > 0 && mesh.imageHeight > 0
+        ? mesh.imageHeight / mesh.imageWidth
+        : 1.0;
+    final rawDepths = Float32List(mesh.landmarks.length);
     final raw = List<Offset>.generate(mesh.landmarks.length, (index) {
-      return mesh.landmarkAsOffset(
-        mesh.landmarks[index],
-        targetSize: targetSize,
-        rotationDegrees: 0,
-        mirrorHorizontal: mirrorHorizontal,
-      );
+      final landmark = mesh.landmarks[index];
+      rawDepths[index] = landmark.z;
+      // 在内部使用等距坐标，避免竖屏归一化 y 轴因长宽比而低估速度与旋转。
+      return Offset(landmark.x, landmark.y * coordinateAspectRatio);
     }, growable: false);
 
-    if (_positions.length != raw.length || _lastSourceTimestamp == null) {
-      _seed(raw, timestamp);
+    if (_positions.length != raw.length ||
+        _lastSourceTimestamp == null ||
+        (_coordinateAspectRatio - coordinateAspectRatio).abs() > 0.01) {
+      _seed(raw, rawDepths, timestamp, sourceSequence, coordinateAspectRatio);
       return predict(
         displayTimestamp: displayTime,
         maximumPrediction: maximumPrediction,
@@ -76,7 +85,7 @@ class AdaptiveLandmarkSmoother {
     final previousScale = _faceScale;
     final previousAngle = _angle;
     final rawCenter = _average(raw, _poseAnchors);
-    final rawScale = math.max(1.0, (raw[454] - raw[234]).distance);
+    final rawScale = math.max(0.0001, (raw[454] - raw[234]).distance);
     final rawAngle = math.atan2(
       raw[454].dy - raw[234].dy,
       raw[454].dx - raw[234].dx,
@@ -129,6 +138,21 @@ class AdaptiveLandmarkSmoother {
         velocityAlpha,
       )!;
       _positions[i] = next;
+
+      final previousDepth = _depths[i];
+      var depthDelta = rawDepths[i] - previousDepth;
+      final maximumDepthDelta = rawScale * 0.09;
+      depthDelta = depthDelta
+          .clamp(-maximumDepthDelta, maximumDepthDelta)
+          .toDouble();
+      final nextDepth = previousDepth + depthDelta * localAlpha;
+      final measuredDepthVelocity = (nextDepth - previousDepth) / dt;
+      _depthVelocities[i] = _lerpDouble(
+        _depthVelocities[i],
+        measuredDepthVelocity,
+        velocityAlpha,
+      );
+      _depths[i] = nextDepth;
     }
 
     _center = _average(_positions, _poseAnchors);
@@ -139,7 +163,7 @@ class AdaptiveLandmarkSmoother {
       poseAlpha,
     )!;
 
-    _faceScale = math.max(1.0, (_positions[454] - _positions[234]).distance);
+    _faceScale = math.max(0.0001, (_positions[454] - _positions[234]).distance);
     final measuredScaleVelocity = (_faceScale - previousScale) / dt;
     _scaleVelocity = _lerpDouble(
       _scaleVelocity,
@@ -158,6 +182,7 @@ class AdaptiveLandmarkSmoother {
       poseAlpha * 0.72,
     );
     _lastSourceTimestamp = timestamp;
+    _lastSourceSequence = sourceSequence;
     return predict(
       displayTimestamp: displayTime,
       maximumPrediction: maximumPrediction,
@@ -165,7 +190,7 @@ class AdaptiveLandmarkSmoother {
   }
 
   /// 生成显示时刻的预测结果。预测窗口很短，超过上限会自动钳制以免过冲。
-  List<Offset>? predict({
+  NormalizedFaceFrame? predict({
     Duration? displayTimestamp,
     Duration maximumPrediction = defaultMaximumPrediction,
   }) {
@@ -177,8 +202,6 @@ class AdaptiveLandmarkSmoother {
       maximumPrediction.inMicroseconds,
     );
     final horizon = micros / Duration.microsecondsPerSecond;
-    if (horizon == 0) return List<Offset>.unmodifiable(_positions);
-
     final maxTranslation = _faceScale * 0.095;
     var translation = _centerVelocity * horizon;
     if (translation.distance > maxTranslation) {
@@ -192,21 +215,34 @@ class AdaptiveLandmarkSmoother {
     final cosR = math.cos(rotation);
     final sinR = math.sin(rotation);
 
-    return List<Offset>.unmodifiable(
-      List<Offset>.generate(_positions.length, (index) {
-        final relative = (_positions[index] - _center) * scaleFactor;
-        final rigid = Offset(
-          relative.dx * cosR - relative.dy * sinR,
-          relative.dx * sinR + relative.dy * cosR,
-        );
-        final localVelocity = _velocities[index] - _centerVelocity;
-        final localLead = localVelocity * (horizon * 0.16);
-        final maxLocalLead = _faceScale * 0.012;
-        final clampedLocalLead = localLead.distance > maxLocalLead
-            ? localLead / localLead.distance * maxLocalLead
-            : localLead;
-        return _center + translation + rigid + clampedLocalLead;
-      }, growable: false),
+    final packed = Float32List(_positions.length * 3);
+    for (var index = 0; index < _positions.length; index++) {
+      final relative = (_positions[index] - _center) * scaleFactor;
+      final rigid = Offset(
+        relative.dx * cosR - relative.dy * sinR,
+        relative.dx * sinR + relative.dy * cosR,
+      );
+      final localVelocity = _velocities[index] - _centerVelocity;
+      final localLead = localVelocity * (horizon * 0.16);
+      final maxLocalLead = _faceScale * 0.012;
+      final clampedLocalLead = localLead.distance > maxLocalLead
+          ? localLead / localLead.distance * maxLocalLead
+          : localLead;
+      final predicted = _center + translation + rigid + clampedLocalLead;
+      final maximumDepthLead = _faceScale * 0.02;
+      final depthLead = (_depthVelocities[index] * horizon * 0.12).clamp(
+        -maximumDepthLead,
+        maximumDepthLead,
+      );
+      packed[index * 3] = predicted.dx;
+      packed[index * 3 + 1] = predicted.dy / _coordinateAspectRatio;
+      packed[index * 3 + 2] = _depths[index] + depthLead;
+    }
+    return NormalizedFaceFrame(
+      xyz: packed,
+      sourceSequence: _lastSourceSequence,
+      sourceTimestamp: _lastSourceTimestamp!,
+      presentationTimestamp: now,
     );
   }
 
@@ -217,33 +253,45 @@ class AdaptiveLandmarkSmoother {
     required bool mirrorHorizontal,
   }) => observe(
     mesh: mesh,
-    targetSize: targetSize,
-    mirrorHorizontal: mirrorHorizontal,
-  );
+  )?.projectToPixels(targetSize, mirrorHorizontal: mirrorHorizontal);
 
   void reset() {
     _positions.clear();
     _velocities.clear();
+    _depths = Float32List(0);
+    _depthVelocities = Float32List(0);
     _lastSourceTimestamp = null;
+    _lastSourceSequence = 0;
     _center = Offset.zero;
     _centerVelocity = Offset.zero;
     _faceScale = 1;
     _scaleVelocity = 0;
     _angle = 0;
     _angularVelocity = 0;
+    _coordinateAspectRatio = 1;
   }
 
-  void _seed(List<Offset> raw, Duration timestamp) {
+  void _seed(
+    List<Offset> raw,
+    Float32List rawDepths,
+    Duration timestamp,
+    int sourceSequence,
+    double coordinateAspectRatio,
+  ) {
     _positions
       ..clear()
       ..addAll(raw);
     _velocities
       ..clear()
       ..addAll(List<Offset>.filled(raw.length, Offset.zero));
+    _depths = Float32List.fromList(rawDepths);
+    _depthVelocities = Float32List(raw.length);
     _center = _average(raw, _poseAnchors);
-    _faceScale = math.max(1.0, (raw[454] - raw[234]).distance);
+    _faceScale = math.max(0.0001, (raw[454] - raw[234]).distance);
     _angle = math.atan2(raw[454].dy - raw[234].dy, raw[454].dx - raw[234].dx);
     _lastSourceTimestamp = timestamp;
+    _lastSourceSequence = sourceSequence;
+    _coordinateAspectRatio = coordinateAspectRatio;
   }
 
   static Offset _average(List<Offset> points, List<int> indices) {
