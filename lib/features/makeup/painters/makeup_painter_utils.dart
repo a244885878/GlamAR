@@ -99,6 +99,19 @@ abstract final class MakeupPainterUtils {
   static double faceWidth(List<Offset> points) =>
       (points[454] - points[234]).distance;
 
+  static double localSpan(List<Offset> points, int start, int end) =>
+      (points[end] - points[start]).distance;
+
+  /// 细节笔触随局部部位缩放，同时保留亚像素下限，避免远距离预览闪烁。
+  static double scaledSize(
+    double localReference,
+    double factor, {
+    double minimum = 0.42,
+    double maximum = double.infinity,
+  }) => (localReference * factor)
+      .clamp(minimum, math.max(minimum, maximum))
+      .toDouble();
+
   static Path closedPath(List<Offset> points, List<int> indices) {
     final path = Path()
       ..moveTo(points[indices.first].dx, points[indices.first].dy);

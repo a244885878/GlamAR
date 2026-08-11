@@ -32,13 +32,21 @@ class EyelinerPainter extends CustomPainter {
         sideA: false,
       ),
     ]) {
-      final opacity = renderContext.opacityForSide(sideA: entry.sideA);
+      final opacity = renderContext.detailOpacityForSide(sideA: entry.sideA);
+      final localEyeWidth =
+          (landmarks[entry.indices.last] - landmarks[entry.indices.first])
+              .distance;
       final paint = Paint()
         ..color = color.withValues(alpha: config.intensity * opacity * 0.9)
         ..style = PaintingStyle.stroke
         ..strokeCap = StrokeCap.round
         ..strokeJoin = StrokeJoin.round
-        ..strokeWidth = width * (0.004 + config.detail * 0.004)
+        ..strokeWidth = MakeupPainterUtils.scaledSize(
+          localEyeWidth,
+          0.02 + config.detail * 0.02,
+          minimum: 0.52,
+          maximum: width * 0.012,
+        )
         ..blendMode = BlendMode.multiply;
       final path = MakeupPainterUtils.smoothOpenPath(landmarks, entry.indices);
       final outerIndex = entry.tailAtStart
@@ -46,9 +54,6 @@ class EyelinerPainter extends CustomPainter {
           : entry.indices.last;
       final outer = landmarks[outerIndex];
       final sign = outer.dx < landmarks[1].dx ? -1.0 : 1.0;
-      final localEyeWidth =
-          (landmarks[entry.indices.last] - landmarks[entry.indices.first])
-              .distance;
       final tailLength = localEyeWidth * (0.1 + config.detail * 0.24);
       path.moveTo(outer.dx, outer.dy);
       path.quadraticBezierTo(
@@ -62,7 +67,12 @@ class EyelinerPainter extends CustomPainter {
       if (config.detail > 0.46) {
         final lashPaint = Paint()
           ..color = color.withValues(alpha: config.intensity * opacity * 0.55)
-          ..strokeWidth = width * 0.002
+          ..strokeWidth = MakeupPainterUtils.scaledSize(
+            localEyeWidth,
+            0.009,
+            minimum: 0.34,
+            maximum: width * 0.004,
+          )
           ..strokeCap = StrokeCap.round
           ..blendMode = BlendMode.multiply;
         for (var i = 2; i < entry.indices.length - 1; i += 2) {
@@ -71,8 +81,8 @@ class EyelinerPainter extends CustomPainter {
           canvas.drawLine(
             p,
             Offset(
-              p.dx + away * width * 0.005,
-              p.dy - width * (0.012 + config.detail * 0.012),
+              p.dx + away * localEyeWidth * 0.025,
+              p.dy - localEyeWidth * (0.06 + config.detail * 0.06),
             ),
             lashPaint,
           );

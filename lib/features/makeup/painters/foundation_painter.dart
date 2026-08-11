@@ -61,17 +61,20 @@ class FoundationPainter extends CustomPainter {
     );
 
     // 对鼻翼与眼下做非常轻的提亮，模拟逐像素美颜中的肤色均衡层。
-    for (final entry in <({int anchor, bool sideA})>[
-      (anchor: 117, sideA: true),
-      (anchor: 346, sideA: false),
+    for (final entry in <({int anchor, int edge, bool sideA})>[
+      (anchor: 117, edge: 234, sideA: true),
+      (anchor: 346, edge: 454, sideA: false),
     ]) {
       final anchor = entry.anchor;
       final underEye = landmarks[anchor];
-      final sideOpacity = renderContext.opacityForSide(sideA: entry.sideA);
+      final localSpan = (underEye - landmarks[entry.edge]).distance;
+      final sideOpacity = renderContext.detailOpacityForSide(
+        sideA: entry.sideA,
+      );
       final correctionRect = Rect.fromCenter(
         center: Offset.lerp(underEye, center, 0.13)!,
-        width: faceWidth * 0.25,
-        height: faceWidth * 0.13,
+        width: localSpan * 1.25,
+        height: localSpan * 0.65,
       );
       canvas.drawOval(
         correctionRect,
@@ -88,7 +91,15 @@ class FoundationPainter extends CustomPainter {
             ],
           ).createShader(correctionRect)
           ..blendMode = BlendMode.screen
-          ..maskFilter = MaskFilter.blur(BlurStyle.normal, faceWidth * 0.012),
+          ..maskFilter = MaskFilter.blur(
+            BlurStyle.normal,
+            MakeupPainterUtils.scaledSize(
+              localSpan,
+              0.06,
+              minimum: 0.48,
+              maximum: faceWidth * 0.02,
+            ),
+          ),
       );
     }
 
@@ -99,13 +110,16 @@ class FoundationPainter extends CustomPainter {
     ]) {
       final anchor = entry.anchor;
       final p = landmarks[anchor];
-      final sideOpacity = renderContext.opacityForSide(sideA: entry.sideA);
+      final localSpan = (p - center).distance;
+      final sideOpacity = renderContext.detailOpacityForSide(
+        sideA: entry.sideA,
+      );
       final rect = Rect.fromCenter(
         center: Offset(
           p.dx + (center.dx - p.dx) * 0.08,
           p.dy + faceWidth * 0.16,
         ),
-        width: faceWidth * 0.24,
+        width: localSpan * 0.53,
         height: faceWidth * 0.62,
       );
       canvas.drawOval(
@@ -115,7 +129,15 @@ class FoundationPainter extends CustomPainter {
             alpha: config.intensity * config.detail * sideOpacity * 0.11,
           )
           ..blendMode = BlendMode.multiply
-          ..maskFilter = MaskFilter.blur(BlurStyle.normal, faceWidth * 0.045),
+          ..maskFilter = MaskFilter.blur(
+            BlurStyle.normal,
+            MakeupPainterUtils.scaledSize(
+              localSpan,
+              0.1,
+              minimum: 0.8,
+              maximum: faceWidth * 0.06,
+            ),
+          ),
       );
     }
 

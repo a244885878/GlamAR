@@ -25,30 +25,55 @@ class BrowPainter extends CustomPainter {
     ]) {
       final indices = brow.indices;
       final opacity = renderContext.opacityForSide(sideA: brow.sideA);
+      final detailOpacity = renderContext.detailOpacityForSide(
+        sideA: brow.sideA,
+      );
+      final browSpan =
+          (landmarks[indices.last] - landmarks[indices.first]).distance;
       final path = MakeupPainterUtils.smoothOpenPath(landmarks, indices);
       canvas.drawPath(
         path,
         Paint()
           ..color = color.withValues(alpha: config.intensity * opacity * 0.62)
           ..style = PaintingStyle.stroke
-          ..strokeWidth = width * (0.009 + config.detail * 0.006)
+          ..strokeWidth = MakeupPainterUtils.scaledSize(
+            browSpan,
+            0.05 + config.detail * 0.035,
+            minimum: 0.65,
+            maximum: width * 0.02,
+          )
           ..strokeCap = StrokeCap.round
           ..strokeJoin = StrokeJoin.round
           ..blendMode = BlendMode.multiply
-          ..maskFilter = MaskFilter.blur(BlurStyle.normal, width * 0.0025),
+          ..maskFilter = MaskFilter.blur(
+            BlurStyle.normal,
+            MakeupPainterUtils.scaledSize(
+              browSpan,
+              0.014,
+              minimum: 0.28,
+              maximum: width * 0.005,
+            ),
+          ),
       );
 
       final hairPaint = Paint()
-        ..color = color.withValues(alpha: config.intensity * opacity * 0.4)
-        ..strokeWidth = width * 0.0018
+        ..color = color.withValues(
+          alpha: config.intensity * detailOpacity * 0.4,
+        )
+        ..strokeWidth = MakeupPainterUtils.scaledSize(
+          browSpan,
+          0.01,
+          minimum: 0.32,
+          maximum: width * 0.004,
+        )
         ..strokeCap = StrokeCap.round
         ..blendMode = BlendMode.multiply;
       for (var i = 0; i < indices.length; i++) {
         final p = landmarks[indices[i]];
-        final direction = i < 2 ? -0.018 : -0.012;
+        final verticalFactor = i < 2 ? -0.1 : -0.067;
         canvas.drawLine(
           p,
-          Offset(p.dx + width * 0.006, p.dy + width * direction),
+          Offset(p.dx + browSpan * 0.033, p.dy + browSpan * verticalFactor),
           hairPaint,
         );
       }

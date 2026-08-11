@@ -42,6 +42,9 @@ class EyeshadowPainter extends CustomPainter {
     ]) {
       final indices = eye.indices;
       final opacity = renderContext.opacityForSide(sideA: eye.sideA);
+      final detailOpacity = renderContext.detailOpacityForSide(
+        sideA: eye.sideA,
+      );
       final eyeWidth =
           (landmarks[indices.last] - landmarks[indices.first]).distance;
       final lift = eyeWidth * (0.2 + config.detail * 0.14);
@@ -68,7 +71,14 @@ class EyeshadowPainter extends CustomPainter {
             stops: const [0, 0.28, 0.7, 1],
           ).createShader(bounds)
           ..blendMode = BlendMode.softLight
-          ..maskFilter = MaskFilter.blur(BlurStyle.normal, width * 0.006),
+          ..maskFilter = MaskFilter.blur(
+            BlurStyle.normal,
+            MakeupPainterUtils.scaledSize(
+              eyeWidth,
+              0.028,
+              maximum: width * 0.01,
+            ),
+          ),
       );
 
       final lashLine = MakeupPainterUtils.smoothOpenPath(landmarks, indices);
@@ -79,12 +89,25 @@ class EyeshadowPainter extends CustomPainter {
             color,
             Colors.black,
             0.38,
-          )!.withValues(alpha: config.intensity * opacity * 0.18)
+          )!.withValues(alpha: config.intensity * detailOpacity * 0.18)
           ..style = PaintingStyle.stroke
-          ..strokeWidth = width * 0.005
+          ..strokeWidth = MakeupPainterUtils.scaledSize(
+            eyeWidth,
+            0.026,
+            minimum: 0.5,
+            maximum: width * 0.009,
+          )
           ..strokeCap = StrokeCap.round
           ..blendMode = BlendMode.multiply
-          ..maskFilter = MaskFilter.blur(BlurStyle.normal, width * 0.003),
+          ..maskFilter = MaskFilter.blur(
+            BlurStyle.normal,
+            MakeupPainterUtils.scaledSize(
+              eyeWidth,
+              0.014,
+              minimum: 0.3,
+              maximum: width * 0.005,
+            ),
+          ),
       );
 
       if (config.detail > 0.62) {
@@ -112,7 +135,7 @@ class EyeshadowPainter extends CustomPainter {
                     .withValues(
                       alpha:
                           config.intensity *
-                          opacity *
+                          detailOpacity *
                           renderContext.highlightOpacity *
                           0.22,
                     ),
@@ -120,7 +143,15 @@ class EyeshadowPainter extends CustomPainter {
               ],
             ).createShader(shimmerRect)
             ..blendMode = BlendMode.screen
-            ..maskFilter = MaskFilter.blur(BlurStyle.normal, width * 0.004),
+            ..maskFilter = MaskFilter.blur(
+              BlurStyle.normal,
+              MakeupPainterUtils.scaledSize(
+                eyeWidth,
+                0.018,
+                minimum: 0.35,
+                maximum: width * 0.007,
+              ),
+            ),
         );
         canvas.restore();
       }

@@ -35,7 +35,7 @@ class BlushPainter extends CustomPainter {
       final center = Offset.lerp(raw, highTarget, highMix)!;
       final pulled = Offset.lerp(center, faceCenter, 0.05)!;
       final localCheekSpan = (raw - landmarks[cheek.edge]).distance;
-      final perspective = (localCheekSpan / (width * 0.2)).clamp(0.58, 1.08);
+      final perspective = (localCheekSpan / (width * 0.2)).clamp(0.72, 1.06);
       final opacity = renderContext.opacityForSide(sideA: cheek.sideA);
       canvas.save();
       canvas.translate(pulled.dx, pulled.dy);
@@ -43,7 +43,7 @@ class BlushPainter extends CustomPainter {
       final rect = Rect.fromCenter(
         center: Offset.zero,
         width: localCheekSpan * (1.35 + config.detail * 0.34),
-        height: width * (0.17 + (1 - config.detail) * 0.05),
+        height: localCheekSpan * (0.84 + (1 - config.detail) * 0.26),
       );
       canvas.drawOval(
         rect,
@@ -61,7 +61,15 @@ class BlushPainter extends CustomPainter {
             stops: const [0, 0.52, 1],
           ).createShader(rect)
           ..blendMode = BlendMode.softLight
-          ..maskFilter = MaskFilter.blur(BlurStyle.normal, width * 0.018),
+          ..maskFilter = MaskFilter.blur(
+            BlurStyle.normal,
+            MakeupPainterUtils.scaledSize(
+              localCheekSpan,
+              0.09,
+              minimum: 0.7,
+              maximum: width * 0.03,
+            ),
+          ),
       );
       canvas.restore();
     }

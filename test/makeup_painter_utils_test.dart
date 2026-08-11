@@ -33,6 +33,15 @@ void main() {
     expect(skin.contains(const Offset(200, 285)), isFalse);
     expect(skin.contains(const Offset(115, 235)), isTrue);
   });
+
+  test('local detail sizes stay inside pixel safety bounds', () {
+    expect(MakeupPainterUtils.scaledSize(8, 0.01, minimum: 0.4), 0.4);
+    expect(MakeupPainterUtils.scaledSize(400, 0.1, maximum: 12), 12);
+    expect(
+      MakeupPainterUtils.scaledSize(80, 0.05, minimum: 0.5, maximum: 8),
+      4,
+    );
+  });
 }
 
 void _placeEllipse(

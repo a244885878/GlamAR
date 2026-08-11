@@ -219,6 +219,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   }) {
     _consecutiveInferenceErrors = 0;
     final hadFace = _landmarkCount >= 468;
+    final hadRecentGeometry = _lastValidMeshTimestamp != null;
     _meshResult = mesh;
     if (mesh != null) {
       _landmarkCount = mesh.landmarks.length;
@@ -227,7 +228,14 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     if (mesh != null) {
       _lastValidMeshTimestamp = sourceTimestamp;
       _makeupTrackingOpacity = 1;
-      _renderContext = FaceRenderContext.fromMesh(mesh, _faceLighting);
+      final observedContext = FaceRenderContext.fromMesh(mesh, _faceLighting);
+      _renderContext = hadRecentGeometry
+          ? FaceRenderContext.stabilizeGeometry(
+              _renderContext,
+              observedContext,
+              0.42,
+            )
+          : observedContext;
     }
     _lastMeshFrameTimestamp = sourceTimestamp;
     _updateTrackedLandmarks(mesh, sourceTimestamp: sourceTimestamp);
@@ -758,6 +766,10 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
             mirrorHorizontal: mirrorPhoto,
           );
         }, growable: false);
+        final photoRenderContext = FaceRenderContext.fromMesh(
+          mesh,
+          _faceLighting,
+        );
         if (_activeLook.complexion.enabled) {
           final faceWidth = MakeupPainterUtils.faceWidth(photoLandmarks);
           final skinPath = MakeupPainterUtils.skinPath(
@@ -774,12 +786,12 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
               final shader = (await MakeupShaderPrograms.skin())
                   .fragmentShader();
               final config = _activeLook.complexion;
-              final adaptedColor = _renderContext.adaptColor(config.color);
+              final adaptedColor = photoRenderContext.adaptColor(config.color);
               shader
                 ..setFloat(
                   2,
                   config.intensity *
-                      _renderContext.centralOpacity *
+                      photoRenderContext.centralOpacity *
                       (0.18 + config.detail * 0.12),
                 )
                 ..setFloat(3, adaptedColor.r)
@@ -787,7 +799,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                 ..setFloat(5, adaptedColor.b)
                 ..setFloat(
                   6,
-                  config.intensity * _renderContext.centralOpacity * 0.055,
+                  config.intensity * photoRenderContext.centralOpacity * 0.055,
                 );
               skinPaint.imageFilter = ui.ImageFilter.shader(shader);
               photoShaders.add(shader);
@@ -816,12 +828,15 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
             final lipShader = (await MakeupShaderPrograms.lips())
                 .fragmentShader();
             final config = _activeLook.lips;
-            final adaptedColor = _renderContext.adaptColor(config.color);
+            final adaptedColor = photoRenderContext.adaptColor(config.color);
             lipShader
               ..setFloat(2, adaptedColor.r)
               ..setFloat(3, adaptedColor.g)
               ..setFloat(4, adaptedColor.b)
-              ..setFloat(5, config.intensity * _renderContext.centralOpacity)
+              ..setFloat(
+                5,
+                config.intensity * photoRenderContext.centralOpacity,
+              )
               ..setFloat(6, switch (_activeLook.lipFinish) {
                 LipFinish.velvet => 0,
                 LipFinish.satin => 0.48,
@@ -849,7 +864,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
           targetSize,
           photoLandmarks,
           _activeLook,
-          renderContext: _renderContext,
+          renderContext: photoRenderContext,
         );
         if (photoOcclusionImage != null && photoOcclusion != null) {
           _erasePhotoOcclusion(

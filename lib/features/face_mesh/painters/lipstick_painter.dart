@@ -23,6 +23,7 @@ class LipstickPainter extends CustomPainter {
     final lipPath = MakeupPainterUtils.lipPath(landmarkPixels);
     final bounds = lipPath.getBounds();
     final faceWidth = MakeupPainterUtils.faceWidth(landmarkPixels);
+    final lipWidth = bounds.width > 1 ? bounds.width : 1.0;
     final color = renderContext.adaptColor(config.color);
     final opacity = renderContext.centralOpacity;
     final upperColor = Color.lerp(color, Colors.black, 0.13)!;
@@ -34,7 +35,15 @@ class LipstickPainter extends CustomPainter {
       Paint()
         ..color = color.withValues(alpha: config.intensity * opacity * 0.16)
         ..blendMode = BlendMode.softLight
-        ..maskFilter = MaskFilter.blur(BlurStyle.normal, faceWidth * 0.0035),
+        ..maskFilter = MaskFilter.blur(
+          BlurStyle.normal,
+          MakeupPainterUtils.scaledSize(
+            lipWidth,
+            0.01,
+            minimum: 0.32,
+            maximum: faceWidth * 0.006,
+          ),
+        ),
     );
 
     canvas.drawPath(
@@ -67,7 +76,12 @@ class LipstickPainter extends CustomPainter {
           alpha: config.intensity * opacity * 0.15,
         )
         ..style = PaintingStyle.stroke
-        ..strokeWidth = faceWidth * 0.0022
+        ..strokeWidth = MakeupPainterUtils.scaledSize(
+          lipWidth,
+          0.0065,
+          minimum: 0.38,
+          maximum: faceWidth * 0.004,
+        )
         ..strokeJoin = StrokeJoin.round
         ..blendMode = BlendMode.multiply,
     );
@@ -90,13 +104,22 @@ class LipstickPainter extends CustomPainter {
                 alpha:
                     config.intensity *
                     opacity *
+                    renderContext.highlightOpacity *
                     (finish == LipFinish.glass ? 0.2 : 0.075),
               ),
               Colors.transparent,
             ],
           ).createShader(glossRect)
           ..blendMode = BlendMode.screen
-          ..maskFilter = MaskFilter.blur(BlurStyle.normal, faceWidth * 0.003),
+          ..maskFilter = MaskFilter.blur(
+            BlurStyle.normal,
+            MakeupPainterUtils.scaledSize(
+              lipWidth,
+              0.009,
+              minimum: 0.3,
+              maximum: faceWidth * 0.005,
+            ),
+          ),
       );
       canvas.restore();
     }

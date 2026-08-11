@@ -67,20 +67,50 @@ class AdaptiveLandmarkSmoother {
     final previousAngle = _angle;
     final rawCenter = _average(raw, _poseAnchors);
     final rawScale = math.max(1.0, (raw[454] - raw[234]).distance);
+    final rawAngle = math.atan2(
+      raw[454].dy - raw[234].dy,
+      raw[454].dx - raw[234].dx,
+    );
     final centerSpeed = (rawCenter - previousCenter).distance / rawScale / dt;
-    final poseResponse = (centerSpeed / 0.72).clamp(0.0, 1.0);
+    final scaleRatio = (rawScale / previousScale).clamp(0.76, 1.32);
+    final poseRotation = _shortestAngle(
+      rawAngle - previousAngle,
+    ).clamp(-0.48, 0.48);
+    final scaleSpeed = (rawScale - previousScale).abs() / previousScale / dt;
+    final rotationSpeed = poseRotation.abs() / dt;
+    final poseResponse = math
+        .max(
+          centerSpeed / 0.72,
+          math.max(scaleSpeed / 1.4, rotationSpeed / 2.4),
+        )
+        .clamp(0.0, 1.0);
     final poseAlpha = 0.34 + poseResponse * 0.58;
+    final cosPose = math.cos(poseRotation);
+    final sinPose = math.sin(poseRotation);
 
     for (var i = 0; i < raw.length; i++) {
       final previous = _positions[i];
-      final distance = (raw[i] - previous).distance;
-      final normalizedSpeed = distance / rawScale / dt;
+      final previousRelative = (previous - previousCenter) * scaleRatio;
+      final poseAligned =
+          rawCenter +
+          Offset(
+            previousRelative.dx * cosPose - previousRelative.dy * sinPose,
+            previousRelative.dx * sinPose + previousRelative.dy * cosPose,
+          );
+      final coherent = Offset.lerp(previous, poseAligned, poseAlpha)!;
+      var residual = raw[i] - poseAligned;
+      final residualDistance = residual.distance;
+      final maxResidual = rawScale * 0.075;
+      if (residualDistance > maxResidual) {
+        residual = residual / residualDistance * maxResidual;
+      }
+      final normalizedSpeed = residualDistance / rawScale / dt;
       final response = (normalizedSpeed / 0.58).clamp(0.0, 1.0);
-      final alpha = 0.22 + response * 0.72;
+      final localAlpha = 0.18 + response * 0.74;
       final deadZone = rawScale * 0.00075;
-      final next = distance <= deadZone
-          ? previous
-          : Offset.lerp(previous, raw[i], alpha)!;
+      final next = residualDistance <= deadZone
+          ? coherent
+          : coherent + residual * localAlpha;
       final measuredVelocity = (next - previous) / dt;
       final velocityAlpha = 0.28 + response * 0.5;
       _velocities[i] = Offset.lerp(

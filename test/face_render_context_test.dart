@@ -44,6 +44,57 @@ void main() {
     );
   });
 
+  test('fades the hidden side more strongly on an extreme profile', () {
+    final frontal = FaceRenderContext.fromMesh(_mesh(), FaceLighting.neutral);
+    final profile = FaceRenderContext.fromMesh(
+      _mesh(
+        sideAInnerX: 0.31,
+        sideAEdgeX: 0.28,
+        sideBInnerX: 0.61,
+        sideBEdgeX: 0.78,
+      ),
+      FaceLighting.neutral,
+    );
+
+    expect(profile.sideAVisibility, lessThan(0.3));
+    expect(profile.centralOpacity, lessThan(frontal.centralOpacity));
+  });
+
+  test('reduces only fine details when the face is far away', () {
+    final near = FaceRenderContext.fromMesh(_mesh(), FaceLighting.neutral);
+    final far = FaceRenderContext.fromMesh(
+      _mesh(
+        sideAInnerX: 0.48,
+        sideAEdgeX: 0.45,
+        sideBInnerX: 0.52,
+        sideBEdgeX: 0.55,
+      ),
+      FaceLighting.neutral,
+    );
+
+    expect(far.fineDetailVisibility, lessThan(near.fineDetailVisibility));
+    expect(far.centralOpacity, closeTo(near.centralOpacity, 0.001));
+  });
+
+  test('stabilizes geometry weights without adding light lag', () {
+    const previous = FaceRenderContext(
+      lighting: FaceLighting(exposure: 0.2),
+      sideAVisibility: 1,
+    );
+    const current = FaceRenderContext(
+      lighting: FaceLighting(exposure: 0.8),
+      sideAVisibility: 0.2,
+    );
+    final stabilized = FaceRenderContext.stabilizeGeometry(
+      previous,
+      current,
+      0.5,
+    );
+
+    expect(stabilized.sideAVisibility, closeTo(0.6, 0.001));
+    expect(stabilized.lighting.exposure, 0.8);
+  });
+
   test('warmth adaptation stays subtle', () {
     const source = Color(0xFFB73255);
     const context = FaceRenderContext(lighting: FaceLighting(warmth: 1));
