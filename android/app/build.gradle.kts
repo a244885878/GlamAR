@@ -20,7 +20,8 @@ android {
         applicationId = "com.glamar.glamar"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = 24
+        // LiteRT 的移动端动态库从 API 26 开始提供完整支持。
+        minSdk = 26
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName

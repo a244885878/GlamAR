@@ -2,20 +2,35 @@ PODS:
   - Flutter (1.0.0)
   - mediapipe_face_mesh (1.10.1):
     - Flutter
+  - TensorFlowLiteC (2.12.0):
+    - TensorFlowLiteC/Core (= 2.12.0)
+  - TensorFlowLiteC/Core (2.12.0)
+  - tflite_flutter (0.0.1):
+    - Flutter
+    - TensorFlowLiteC (= 2.12.0)
 
 DEPENDENCIES:
   - Flutter (from `Flutter`)
   - mediapipe_face_mesh (from `.symlinks/plugins/mediapipe_face_mesh/ios`)
+  - tflite_flutter (from `.symlinks/plugins/tflite_flutter/ios`)
+
+SPEC REPOS:
+  https://gitee.com/mirrors/CocoaPods-Specs.git:
+    - TensorFlowLiteC
 
 EXTERNAL SOURCES:
   Flutter:
     :path: Flutter
   mediapipe_face_mesh:
     :path: ".symlinks/plugins/mediapipe_face_mesh/ios"
+  tflite_flutter:
+    :path: ".symlinks/plugins/tflite_flutter/ios"
 
 SPEC CHECKSUMS:
   Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
   mediapipe_face_mesh: 465f804525f1a3abfb738603df654407c7491b9b
+  TensorFlowLiteC: 20785a69299185a379ba9852b6625f00afd7984a
+  tflite_flutter: cdd27cd3b74b01a0bfadf1dadf44e7e88ac53b27
 
 PODFILE CHECKSUM: 389ceb630909f4778660b302442bba599e6962e5
 

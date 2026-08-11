@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
 import 'package:glamar/app/theme/glamar_theme.dart';
 import 'package:glamar/features/face_mesh/utils/adaptive_landmark_smoother.dart';
+import 'package:glamar/features/face_mesh/utils/face_occlusion_inference_worker.dart';
 import 'package:glamar/features/face_mesh/utils/face_mesh_inference_worker.dart';
 import 'package:glamar/features/makeup/models/face_render_context.dart';
 import 'package:glamar/features/makeup/models/makeup_look.dart';
@@ -38,6 +39,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
 
   CameraController? _cameraController;
   FaceMeshInferenceWorker? _inferenceWorker;
+  FaceOcclusionInferenceWorker? _occlusionWorker;
 
   FaceMeshResult? _meshResult;
   int _landmarkCount = 0;
@@ -45,7 +47,10 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   bool _isInitializing = true;
   bool _isModelReady = false;
   bool _inferBusy = false;
+  bool _occlusionBusy = false;
+  bool _isOcclusionReady = false;
   _PendingCameraFrame? _pendingCameraFrame;
+  _PendingOcclusionFrame? _pendingOcclusionFrame;
   String _statusMessage = '正在启动相机...';
   Size _paintSize = Size.zero;
 
@@ -53,6 +58,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       ValueNotifier<List<Offset>?>(null);
   final ValueNotifier<_TrackingPerformance> _trackingPerformance =
       ValueNotifier<_TrackingPerformance>(const _TrackingPerformance());
+  final ValueNotifier<_OcclusionTexture?> _occlusionTexture =
+      ValueNotifier<_OcclusionTexture?>(null);
   final AdaptiveLandmarkSmoother _landmarkSmoother = AdaptiveLandmarkSmoother();
   late final Ticker _renderTicker;
   late MakeupLook _activeLook;
@@ -68,6 +75,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   int _performanceFrameCount = 0;
   double _inferenceMsEma = 0;
   int _consecutiveInferenceErrors = 0;
+  int _consecutiveOcclusionErrors = 0;
+  DateTime _nextOcclusionAllowedAt = DateTime.fromMillisecondsSinceEpoch(0);
   FaceLighting _faceLighting = FaceLighting.neutral;
   FaceRenderContext _renderContext = const FaceRenderContext.neutral();
 
@@ -140,12 +149,28 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
         _isModelReady = true;
         _statusMessage = '';
       }
+      unawaited(_initOcclusionModel());
     } catch (error) {
       if (mounted) {
         setState(() => _errorMessage ??= '人脸模型加载失败: $error');
       } else {
         _errorMessage ??= '人脸模型加载失败: $error';
       }
+    }
+  }
+
+  Future<void> _initOcclusionModel() async {
+    try {
+      final worker = await FaceOcclusionInferenceWorker.start();
+      if (!mounted) {
+        await worker.close();
+        return;
+      }
+      _occlusionWorker = worker;
+      _isOcclusionReady = true;
+    } catch (_) {
+      // 遮挡是增强链路：个别设备不支持 LiteRT 时仍保留完整 AR 妆容。
+      _isOcclusionReady = false;
     }
   }
 
@@ -195,6 +220,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     _faceLighting = FaceLighting.lerp(_faceLighting, lighting, 0.18);
     if (mesh != null) {
       _renderContext = FaceRenderContext.fromMesh(mesh, _faceLighting);
+    } else {
+      _clearOcclusionTexture();
     }
     _lastMeshFrameTimestamp = sourceTimestamp;
     _updateTrackedLandmarks(mesh, sourceTimestamp: sourceTimestamp);
@@ -272,6 +299,19 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       receivedAt: DateTime.now(),
     );
     unawaited(_processLatestFrame());
+
+    final mesh = _meshResult;
+    final now = DateTime.now();
+    if (_isOcclusionReady &&
+        _occlusionWorker != null &&
+        mesh != null &&
+        !now.isBefore(_nextOcclusionAllowedAt)) {
+      _pendingOcclusionFrame = _PendingOcclusionFrame(
+        image: image,
+        roi: _occlusionRoiForMesh(mesh),
+      );
+      unawaited(_processLatestOcclusionFrame());
+    }
   }
 
   Future<void> _processLatestFrame() async {
@@ -316,6 +356,109 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     }
   }
 
+  Future<void> _processLatestOcclusionFrame() async {
+    if (_occlusionBusy || !_isOcclusionReady || _occlusionWorker == null) {
+      return;
+    }
+    final pending = _pendingOcclusionFrame;
+    final controller = _cameraController;
+    if (pending == null ||
+        controller == null ||
+        !controller.value.isInitialized) {
+      return;
+    }
+    final rotation = _rotationCompensation(controller);
+    if (rotation == null) return;
+
+    _pendingOcclusionFrame = null;
+    _occlusionBusy = true;
+    try {
+      final mask = await _occlusionWorker!.processCameraImage(
+        pending.image,
+        rotationDegrees: rotation,
+        isAndroid: Platform.isAndroid,
+        roi: pending.roi,
+      );
+      _consecutiveOcclusionErrors = 0;
+      await _updateOcclusionTexture(mask);
+    } catch (_) {
+      _consecutiveOcclusionErrors++;
+      _occlusionWorker?.reset();
+      if (_consecutiveOcclusionErrors >= 3) {
+        _isOcclusionReady = false;
+        _clearOcclusionTexture();
+      }
+    } finally {
+      _occlusionBusy = false;
+      // 给 FaceMesh 留出 CPU 时片，遮挡蒙版以稳定性而非高帧率为主。
+      _nextOcclusionAllowedAt = DateTime.now().add(
+        const Duration(milliseconds: 70),
+      );
+    }
+  }
+
+  FaceOcclusionRoi _occlusionRoiForMesh(FaceMeshResult mesh) {
+    var minX = 1.0;
+    var maxX = 0.0;
+    var minY = 1.0;
+    var maxY = 0.0;
+    for (final point in mesh.landmarks) {
+      minX = point.x < minX ? point.x : minX;
+      maxX = point.x > maxX ? point.x : maxX;
+      minY = point.y < minY ? point.y : minY;
+      maxY = point.y > maxY ? point.y : maxY;
+    }
+    final faceWidth = maxX - minX;
+    final faceHeight = maxY - minY;
+    final left = (minX - faceWidth * 0.16).clamp(0.0, 1.0);
+    final right = (maxX + faceWidth * 0.16).clamp(0.0, 1.0);
+    final top = (minY - faceHeight * 0.12).clamp(0.0, 1.0);
+    final bottom = (maxY + faceHeight * 0.08).clamp(0.0, 1.0);
+    return FaceOcclusionRoi(
+      left: left,
+      top: top,
+      width: right - left,
+      height: bottom - top,
+    );
+  }
+
+  Future<void> _updateOcclusionTexture(FaceOcclusionMask mask) async {
+    final image = await _decodeOcclusionImage(mask.rgba);
+    if (!mounted) {
+      image.dispose();
+      return;
+    }
+    final old = _occlusionTexture.value;
+    _occlusionTexture.value = _OcclusionTexture(image: image, roi: mask.roi);
+    if (old != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => old.image.dispose());
+    }
+  }
+
+  Future<ui.Image> _decodeOcclusionImage(Uint8List rgba) async {
+    final buffer = await ui.ImmutableBuffer.fromUint8List(rgba);
+    final descriptor = ui.ImageDescriptor.raw(
+      buffer,
+      width: 256,
+      height: 256,
+      pixelFormat: ui.PixelFormat.rgba8888,
+    );
+    final codec = await descriptor.instantiateCodec();
+    final frame = await codec.getNextFrame();
+    codec.dispose();
+    descriptor.dispose();
+    buffer.dispose();
+    return frame.image;
+  }
+
+  void _clearOcclusionTexture() {
+    final old = _occlusionTexture.value;
+    _occlusionTexture.value = null;
+    if (old != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => old.image.dispose());
+    }
+  }
+
   int? _rotationCompensation(CameraController controller) {
     if (Platform.isAndroid) {
       final deviceRotation =
@@ -337,12 +480,16 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
 
   void _stopInferenceStream() {
     _inferBusy = false;
+    _occlusionBusy = false;
     _pendingCameraFrame = null;
+    _pendingOcclusionFrame = null;
     _inferenceWorker?.reset();
+    _occlusionWorker?.reset();
     _lastMeshFrameTimestamp = null;
     _performanceWindowStartedAt = null;
     _performanceFrameCount = 0;
     _consecutiveInferenceErrors = 0;
+    _consecutiveOcclusionErrors = 0;
     _faceLighting = FaceLighting.neutral;
     _renderContext = const FaceRenderContext.neutral();
   }
@@ -359,6 +506,10 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       _cameraController = null;
       unawaited(_inferenceWorker?.close());
       _inferenceWorker = null;
+      unawaited(_occlusionWorker?.close());
+      _occlusionWorker = null;
+      _isOcclusionReady = false;
+      _clearOcclusionTexture();
       _isModelReady = false;
       _meshResult = null;
       _landmarkCount = 0;
@@ -382,8 +533,12 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     _cameraController?.dispose();
     unawaited(_inferenceWorker?.close());
     _inferenceWorker = null;
+    unawaited(_occlusionWorker?.close());
+    _occlusionWorker = null;
+    _clearOcclusionTexture();
     _makeupLandmarks.dispose();
     _trackingPerformance.dispose();
+    _occlusionTexture.dispose();
     super.dispose();
   }
 
@@ -410,6 +565,73 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       Rect.fromLTWH(0, 0, source.width.toDouble(), source.height.toDouble()),
       Offset.zero & targetSize,
       paint,
+    );
+    canvas.restore();
+  }
+
+  Future<FaceOcclusionMask?> _inferPhotoOcclusion(
+    ui.Image source,
+    FaceMeshResult mesh,
+  ) async {
+    final worker = _occlusionWorker;
+    if (!_isOcclusionReady || worker == null) return null;
+    try {
+      final longestSide = source.width > source.height
+          ? source.width
+          : source.height;
+      final scale = longestSide > 512 ? 512 / longestSide : 1.0;
+      final width = (source.width * scale).round().clamp(1, 512);
+      final height = (source.height * scale).round().clamp(1, 512);
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(recorder);
+      canvas.drawImageRect(
+        source,
+        Rect.fromLTWH(0, 0, source.width.toDouble(), source.height.toDouble()),
+        Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble()),
+        Paint()..filterQuality = FilterQuality.medium,
+      );
+      final picture = recorder.endRecording();
+      final scaled = await picture.toImage(width, height);
+      picture.dispose();
+      final bytes = await scaled.toByteData(format: ui.ImageByteFormat.rawRgba);
+      scaled.dispose();
+      if (bytes == null) return null;
+      return await worker.processRgba(
+        bytes.buffer.asUint8List(bytes.offsetInBytes, bytes.lengthInBytes),
+        width: width,
+        height: height,
+        roi: _occlusionRoiForMesh(mesh),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  void _erasePhotoOcclusion(
+    Canvas canvas,
+    ui.Image mask,
+    FaceOcclusionRoi roi,
+    Size targetSize, {
+    required bool mirrored,
+  }) {
+    final target = Rect.fromLTWH(
+      roi.left * targetSize.width,
+      roi.top * targetSize.height,
+      roi.width * targetSize.width,
+      roi.height * targetSize.height,
+    );
+    canvas.save();
+    if (mirrored) {
+      canvas.translate(targetSize.width, 0);
+      canvas.scale(-1, 1);
+    }
+    canvas.drawImageRect(
+      mask,
+      Rect.fromLTWH(0, 0, mask.width.toDouble(), mask.height.toDouble()),
+      target,
+      Paint()
+        ..blendMode = BlendMode.dstOut
+        ..filterQuality = FilterQuality.high,
     );
     canvas.restore();
   }
@@ -441,6 +663,12 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
         source.height.toDouble(),
       );
       final mirrorPhoto = _mirrorHorizontal;
+      final photoOcclusion = _makeupVisible
+          ? await _inferPhotoOcclusion(source, mesh)
+          : null;
+      final photoOcclusionImage = photoOcclusion == null
+          ? null
+          : await _decodeOcclusionImage(photoOcclusion.rgba);
 
       final recorder = ui.PictureRecorder();
       final canvas = Canvas(recorder);
@@ -454,6 +682,9 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       );
 
       if (_makeupVisible) {
+        if (photoOcclusionImage != null) {
+          canvas.saveLayer(Offset.zero & targetSize, Paint());
+        }
         final photoLandmarks = List<Offset>.generate(mesh.landmarks.length, (
           index,
         ) {
@@ -557,6 +788,16 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
           _activeLook,
           renderContext: _renderContext,
         );
+        if (photoOcclusionImage != null && photoOcclusion != null) {
+          _erasePhotoOcclusion(
+            canvas,
+            photoOcclusionImage,
+            photoOcclusion.roi,
+            targetSize,
+            mirrored: mirrorPhoto,
+          );
+          canvas.restore();
+        }
       }
 
       final picture = recorder.endRecording();
@@ -578,6 +819,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       );
       codec.dispose();
       source.dispose();
+      photoOcclusionImage?.dispose();
       rendered.dispose();
       if (mounted) {
         setState(() => _showCaptureFlash = true);
@@ -703,7 +945,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                                     if (pixels == null) {
                                       return const SizedBox.shrink();
                                     }
-                                    return Stack(
+                                    final makeup = Stack(
                                       fit: StackFit.expand,
                                       children: [
                                         if (_activeLook.complexion.enabled)
@@ -727,6 +969,20 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                                           ),
                                         ),
                                       ],
+                                    );
+                                    return ValueListenableBuilder<
+                                      _OcclusionTexture?
+                                    >(
+                                      valueListenable: _occlusionTexture,
+                                      child: makeup,
+                                      builder: (context, texture, child) {
+                                        if (texture == null) return child!;
+                                        return _OcclusionMaskedMakeup(
+                                          texture: texture,
+                                          mirrorHorizontal: _mirrorHorizontal,
+                                          child: child!,
+                                        );
+                                      },
                                     );
                                   },
                                 ),
@@ -1032,6 +1288,51 @@ class _FullMakeupPainter extends CustomPainter {
       oldDelegate.landmarks != landmarks ||
       oldDelegate.look != look ||
       oldDelegate.renderContext != renderContext;
+}
+
+class _OcclusionMaskedMakeup extends StatelessWidget {
+  const _OcclusionMaskedMakeup({
+    required this.texture,
+    required this.mirrorHorizontal,
+    required this.child,
+  });
+
+  final _OcclusionTexture texture;
+  final bool mirrorHorizontal;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return ShaderMask(
+      blendMode: BlendMode.dstOut,
+      shaderCallback: (bounds) {
+        final roi = texture.roi;
+        final targetLeft = mirrorHorizontal
+            ? (1 - roi.left - roi.width) * bounds.width
+            : roi.left * bounds.width;
+        final targetTop = roi.top * bounds.height;
+        final targetWidth = roi.width * bounds.width;
+        final targetHeight = roi.height * bounds.height;
+        final transform = Matrix4.identity();
+        if (mirrorHorizontal) {
+          transform
+            ..translateByDouble(targetLeft + targetWidth, targetTop, 0, 1)
+            ..scaleByDouble(-targetWidth / 256, targetHeight / 256, 1, 1);
+        } else {
+          transform
+            ..translateByDouble(targetLeft, targetTop, 0, 1)
+            ..scaleByDouble(targetWidth / 256, targetHeight / 256, 1, 1);
+        }
+        return ui.ImageShader(
+          texture.image,
+          TileMode.decal,
+          TileMode.decal,
+          transform.storage,
+        );
+      },
+      child: child,
+    );
+  }
 }
 
 class _SkinSmoothingLayer extends StatefulWidget {
@@ -1354,6 +1655,20 @@ class _PendingCameraFrame {
 
   final CameraImage image;
   final DateTime receivedAt;
+}
+
+class _PendingOcclusionFrame {
+  const _PendingOcclusionFrame({required this.image, required this.roi});
+
+  final CameraImage image;
+  final FaceOcclusionRoi roi;
+}
+
+class _OcclusionTexture {
+  const _OcclusionTexture({required this.image, required this.roi});
+
+  final ui.Image image;
+  final FaceOcclusionRoi roi;
 }
 
 class _TrackingPerformance {
