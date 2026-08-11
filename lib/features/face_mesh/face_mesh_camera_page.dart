@@ -10,9 +10,11 @@ import 'package:gal/gal.dart';
 import 'package:glamar/app/theme/glamar_theme.dart';
 import 'package:glamar/features/face_mesh/utils/adaptive_landmark_smoother.dart';
 import 'package:glamar/features/face_mesh/utils/face_mesh_inference_worker.dart';
+import 'package:glamar/features/makeup/models/face_render_context.dart';
 import 'package:glamar/features/makeup/models/makeup_look.dart';
 import 'package:glamar/features/makeup/painters/makeup_renderer.dart';
 import 'package:glamar/features/makeup/painters/makeup_painter_utils.dart';
+import 'package:glamar/features/makeup/shaders/makeup_shader_programs.dart';
 import 'package:glamar/features/makeup/widgets/makeup_control_dock.dart';
 import 'package:mediapipe_face_mesh/mediapipe_face_mesh.dart';
 
@@ -66,6 +68,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   int _performanceFrameCount = 0;
   double _inferenceMsEma = 0;
   int _consecutiveInferenceErrors = 0;
+  FaceLighting _faceLighting = FaceLighting.neutral;
+  FaceRenderContext _renderContext = const FaceRenderContext.neutral();
 
   @override
   void initState() {
@@ -74,6 +78,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     _presetLook = widget.initialLook;
     WidgetsBinding.instance.addObserver(this);
     _renderTicker = createTicker(_onRenderTick)..start();
+    unawaited(MakeupShaderPrograms.warmUp().catchError((_) {}));
     _bootstrap();
   }
 
@@ -179,6 +184,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
 
   void _onInferenceResult(
     FaceMeshResult? mesh, {
+    required FaceLighting lighting,
     required DateTime sourceTimestamp,
     required Duration inferenceDuration,
   }) {
@@ -186,6 +192,10 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     final hadFace = _landmarkCount >= 468;
     _meshResult = mesh;
     _landmarkCount = mesh?.landmarks.length ?? 0;
+    _faceLighting = FaceLighting.lerp(_faceLighting, lighting, 0.18);
+    if (mesh != null) {
+      _renderContext = FaceRenderContext.fromMesh(mesh, _faceLighting);
+    }
     _lastMeshFrameTimestamp = sourceTimestamp;
     _updateTrackedLandmarks(mesh, sourceTimestamp: sourceTimestamp);
     _recordPerformance(inferenceDuration, mesh != null);
@@ -286,14 +296,15 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     final stopwatch = Stopwatch()..start();
 
     try {
-      final result = await _inferenceWorker!.process(
+      final sample = await _inferenceWorker!.process(
         pending.image,
         rotationDegrees: rotation,
         isAndroid: Platform.isAndroid,
       );
       stopwatch.stop();
       _onInferenceResult(
-        result,
+        sample.mesh,
+        lighting: sample.lighting,
         sourceTimestamp: pending.receivedAt,
         inferenceDuration: stopwatch.elapsed,
       );
@@ -332,6 +343,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     _performanceWindowStartedAt = null;
     _performanceFrameCount = 0;
     _consecutiveInferenceErrors = 0;
+    _faceLighting = FaceLighting.neutral;
+    _renderContext = const FaceRenderContext.neutral();
   }
 
   @override
@@ -380,6 +393,27 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
         controller?.description.lensDirection == CameraLensDirection.front;
   }
 
+  void _drawPhotoSource(
+    Canvas canvas,
+    ui.Image source,
+    Size targetSize, {
+    required bool mirrored,
+    required Paint paint,
+  }) {
+    canvas.save();
+    if (mirrored) {
+      canvas.translate(targetSize.width, 0);
+      canvas.scale(-1, 1);
+    }
+    canvas.drawImageRect(
+      source,
+      Rect.fromLTWH(0, 0, source.width.toDouble(), source.height.toDouble()),
+      Offset.zero & targetSize,
+      paint,
+    );
+    canvas.restore();
+  }
+
   Future<void> _capturePhoto() async {
     final controller = _cameraController;
     final mesh = _meshResult;
@@ -410,18 +444,14 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
 
       final recorder = ui.PictureRecorder();
       final canvas = Canvas(recorder);
-      canvas.save();
-      if (mirrorPhoto) {
-        canvas.translate(targetSize.width, 0);
-        canvas.scale(-1, 1);
-      }
-      canvas.drawImageRect(
+      final photoShaders = <ui.FragmentShader>[];
+      _drawPhotoSource(
+        canvas,
         source,
-        Rect.fromLTWH(0, 0, source.width.toDouble(), source.height.toDouble()),
-        Offset.zero & targetSize,
-        Paint()..filterQuality = FilterQuality.high,
+        targetSize,
+        mirrored: mirrorPhoto,
+        paint: Paint()..filterQuality = FilterQuality.high,
       );
-      canvas.restore();
 
       if (_makeupVisible) {
         final photoLandmarks = List<Offset>.generate(mesh.landmarks.length, (
@@ -444,42 +474,96 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
           final resolutionScale = _paintSize.width > 0
               ? targetSize.width / _paintSize.width
               : 1.0;
+          final skinPaint = Paint()..filterQuality = FilterQuality.high;
+          if (ui.ImageFilter.isShaderFilterSupported) {
+            try {
+              final shader = (await MakeupShaderPrograms.skin())
+                  .fragmentShader();
+              final config = _activeLook.complexion;
+              final adaptedColor = _renderContext.adaptColor(config.color);
+              shader
+                ..setFloat(
+                  2,
+                  config.intensity *
+                      _renderContext.centralOpacity *
+                      (0.18 + config.detail * 0.12),
+                )
+                ..setFloat(3, adaptedColor.r)
+                ..setFloat(4, adaptedColor.g)
+                ..setFloat(5, adaptedColor.b)
+                ..setFloat(
+                  6,
+                  config.intensity * _renderContext.centralOpacity * 0.055,
+                );
+              skinPaint.imageFilter = ui.ImageFilter.shader(shader);
+              photoShaders.add(shader);
+            } catch (_) {
+              // Shader 不可用时使用保守的低强度回退。
+            }
+          }
+          skinPaint.imageFilter ??= ui.ImageFilter.blur(
+            sigmaX: previewSigma * resolutionScale,
+            sigmaY: previewSigma * resolutionScale,
+          );
           canvas.save();
           canvas.clipPath(skinPath);
-          canvas.save();
-          if (mirrorPhoto) {
-            canvas.translate(targetSize.width, 0);
-            canvas.scale(-1, 1);
-          }
-          canvas.drawImageRect(
+          _drawPhotoSource(
+            canvas,
             source,
-            Rect.fromLTWH(
-              0,
-              0,
-              source.width.toDouble(),
-              source.height.toDouble(),
-            ),
-            Offset.zero & targetSize,
-            Paint()
-              ..filterQuality = FilterQuality.high
-              ..imageFilter = ui.ImageFilter.blur(
-                sigmaX: previewSigma * resolutionScale,
-                sigmaY: previewSigma * resolutionScale,
-              ),
+            targetSize,
+            mirrored: mirrorPhoto,
+            paint: skinPaint,
           );
           canvas.restore();
-          canvas.restore();
+        }
+        if (_activeLook.lips.enabled &&
+            ui.ImageFilter.isShaderFilterSupported) {
+          try {
+            final lipShader = (await MakeupShaderPrograms.lips())
+                .fragmentShader();
+            final config = _activeLook.lips;
+            final adaptedColor = _renderContext.adaptColor(config.color);
+            lipShader
+              ..setFloat(2, adaptedColor.r)
+              ..setFloat(3, adaptedColor.g)
+              ..setFloat(4, adaptedColor.b)
+              ..setFloat(5, config.intensity * _renderContext.centralOpacity)
+              ..setFloat(6, switch (_activeLook.lipFinish) {
+                LipFinish.velvet => 0,
+                LipFinish.satin => 0.48,
+                LipFinish.glass => 1,
+              });
+            canvas.save();
+            canvas.clipPath(MakeupPainterUtils.lipPath(photoLandmarks));
+            _drawPhotoSource(
+              canvas,
+              source,
+              targetSize,
+              mirrored: mirrorPhoto,
+              paint: Paint()
+                ..filterQuality = FilterQuality.high
+                ..imageFilter = ui.ImageFilter.shader(lipShader),
+            );
+            canvas.restore();
+            photoShaders.add(lipShader);
+          } catch (_) {
+            // Canvas 唇妆仍会完整绘制。
+          }
         }
         MakeupRenderer.paintAll(
           canvas,
           targetSize,
           photoLandmarks,
           _activeLook,
+          renderContext: _renderContext,
         );
       }
 
       final picture = recorder.endRecording();
       final rendered = await picture.toImage(source.width, source.height);
+      for (final shader in photoShaders) {
+        shader.dispose();
+      }
       final byteData = await rendered.toByteData(
         format: ui.ImageByteFormat.png,
       );
@@ -626,11 +710,20 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                                           _SkinSmoothingLayer(
                                             landmarks: pixels,
                                             config: _activeLook.complexion,
+                                            renderContext: _renderContext,
+                                          ),
+                                        if (_activeLook.lips.enabled)
+                                          _LipMaterialLayer(
+                                            landmarks: pixels,
+                                            config: _activeLook.lips,
+                                            finish: _activeLook.lipFinish,
+                                            renderContext: _renderContext,
                                           ),
                                         CustomPaint(
                                           painter: _FullMakeupPainter(
                                             landmarks: pixels,
                                             look: _activeLook,
+                                            renderContext: _renderContext,
                                           ),
                                         ),
                                       ],
@@ -913,50 +1006,264 @@ class _TopBar extends StatelessWidget {
 }
 
 class _FullMakeupPainter extends CustomPainter {
-  const _FullMakeupPainter({required this.landmarks, required this.look});
+  const _FullMakeupPainter({
+    required this.landmarks,
+    required this.look,
+    required this.renderContext,
+  });
 
   final List<Offset> landmarks;
   final MakeupLook look;
+  final FaceRenderContext renderContext;
 
   @override
   void paint(Canvas canvas, Size size) {
-    MakeupRenderer.paintAll(canvas, size, landmarks, look);
+    MakeupRenderer.paintAll(
+      canvas,
+      size,
+      landmarks,
+      look,
+      renderContext: renderContext,
+    );
   }
 
   @override
   bool shouldRepaint(_FullMakeupPainter oldDelegate) =>
-      oldDelegate.landmarks != landmarks || oldDelegate.look != look;
+      oldDelegate.landmarks != landmarks ||
+      oldDelegate.look != look ||
+      oldDelegate.renderContext != renderContext;
 }
 
-class _SkinSmoothingLayer extends StatelessWidget {
-  const _SkinSmoothingLayer({required this.landmarks, required this.config});
+class _SkinSmoothingLayer extends StatefulWidget {
+  const _SkinSmoothingLayer({
+    required this.landmarks,
+    required this.config,
+    required this.renderContext,
+  });
 
   final List<Offset> landmarks;
   final MakeupLayerConfig config;
+  final FaceRenderContext renderContext;
+
+  @override
+  State<_SkinSmoothingLayer> createState() => _SkinSmoothingLayerState();
+}
+
+class _SkinSmoothingLayerState extends State<_SkinSmoothingLayer> {
+  ui.FragmentShader? _shader;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadShader();
+  }
+
+  Future<void> _loadShader() async {
+    if (!ui.ImageFilter.isShaderFilterSupported) return;
+    try {
+      final program = await MakeupShaderPrograms.skin();
+      if (!mounted) return;
+      _shader = program.fragmentShader();
+      _updateUniforms();
+      setState(() {});
+    } catch (_) {
+      // 非 Impeller 或个别 GPU 不支持时，build 会使用低强度模糊回退。
+    }
+  }
+
+  @override
+  void didUpdateWidget(_SkinSmoothingLayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.config != widget.config ||
+        oldWidget.renderContext != widget.renderContext) {
+      _updateUniforms();
+    }
+  }
+
+  void _updateUniforms() {
+    final shader = _shader;
+    if (shader == null) return;
+    final config = widget.config;
+    final color = widget.renderContext.adaptColor(config.color);
+    final opacity = widget.renderContext.centralOpacity;
+    shader
+      ..setFloat(2, config.intensity * opacity * (0.18 + config.detail * 0.12))
+      ..setFloat(3, color.r)
+      ..setFloat(4, color.g)
+      ..setFloat(5, color.b)
+      ..setFloat(6, config.intensity * opacity * 0.055);
+  }
 
   @override
   Widget build(BuildContext context) {
-    final faceWidth = MakeupPainterUtils.faceWidth(landmarks);
-    final sigma = _skinSmoothingSigma(config);
+    final faceWidth = MakeupPainterUtils.faceWidth(widget.landmarks);
+    final shader = _shader;
+    final filter = shader != null && ui.ImageFilter.isShaderFilterSupported
+        ? ui.ImageFilter.shader(shader)
+        : ui.ImageFilter.blur(
+            sigmaX: _skinSmoothingSigma(widget.config),
+            sigmaY: _skinSmoothingSigma(widget.config),
+          );
     return IgnorePointer(
       child: ClipPath(
         clipper: _FaceSkinClipper(
-          landmarks: landmarks,
+          landmarks: widget.landmarks,
           featurePadding: faceWidth * 0.018,
         ),
         clipBehavior: Clip.antiAlias,
         child: BackdropFilter(
-          filter: ui.ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
+          filter: filter,
           blendMode: BlendMode.srcOver,
-          child: const ColoredBox(color: Colors.transparent),
+          child: const _FilterCoveragePaint(),
         ),
       ),
     );
   }
+
+  @override
+  void dispose() {
+    _shader?.dispose();
+    super.dispose();
+  }
 }
 
 double _skinSmoothingSigma(MakeupLayerConfig config) =>
-    0.28 + config.intensity * (0.5 + config.detail * 0.42);
+    0.18 + config.intensity * (0.34 + config.detail * 0.22);
+
+class _LipMaterialLayer extends StatefulWidget {
+  const _LipMaterialLayer({
+    required this.landmarks,
+    required this.config,
+    required this.finish,
+    required this.renderContext,
+  });
+
+  final List<Offset> landmarks;
+  final MakeupLayerConfig config;
+  final LipFinish finish;
+  final FaceRenderContext renderContext;
+
+  @override
+  State<_LipMaterialLayer> createState() => _LipMaterialLayerState();
+}
+
+class _LipMaterialLayerState extends State<_LipMaterialLayer> {
+  ui.FragmentShader? _shader;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadShader();
+  }
+
+  Future<void> _loadShader() async {
+    if (!ui.ImageFilter.isShaderFilterSupported) return;
+    try {
+      final program = await MakeupShaderPrograms.lips();
+      if (!mounted) return;
+      _shader = program.fragmentShader();
+      _updateUniforms();
+      setState(() {});
+    } catch (_) {
+      // 保留 Canvas 唇妆作为兼容回退。
+    }
+  }
+
+  @override
+  void didUpdateWidget(_LipMaterialLayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.config != widget.config ||
+        oldWidget.finish != widget.finish ||
+        oldWidget.renderContext != widget.renderContext) {
+      _updateUniforms();
+    }
+  }
+
+  void _updateUniforms() {
+    final shader = _shader;
+    if (shader == null) return;
+    final color = widget.renderContext.adaptColor(widget.config.color);
+    shader
+      ..setFloat(2, color.r)
+      ..setFloat(3, color.g)
+      ..setFloat(4, color.b)
+      ..setFloat(
+        5,
+        widget.config.intensity * widget.renderContext.centralOpacity,
+      )
+      ..setFloat(6, switch (widget.finish) {
+        LipFinish.velvet => 0,
+        LipFinish.satin => 0.48,
+        LipFinish.glass => 1,
+      });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final shader = _shader;
+    if (shader == null || !ui.ImageFilter.isShaderFilterSupported) {
+      return const SizedBox.shrink();
+    }
+    return IgnorePointer(
+      child: ClipPath(
+        clipper: _LipClipper(widget.landmarks),
+        clipBehavior: Clip.antiAlias,
+        child: BackdropFilter(
+          filter: ui.ImageFilter.shader(shader),
+          blendMode: BlendMode.srcOver,
+          child: const _FilterCoveragePaint(),
+        ),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _shader?.dispose();
+    super.dispose();
+  }
+}
+
+class _LipClipper extends CustomClipper<Path> {
+  const _LipClipper(this.landmarks);
+
+  final List<Offset> landmarks;
+
+  @override
+  Path getClip(Size size) => MakeupPainterUtils.lipPath(landmarks);
+
+  @override
+  bool shouldReclip(_LipClipper oldClipper) =>
+      oldClipper.landmarks != landmarks;
+}
+
+class _FilterCoveragePaint extends StatelessWidget {
+  const _FilterCoveragePaint();
+
+  @override
+  Widget build(BuildContext context) => CustomPaint(
+    painter: const _FilterCoveragePainter(),
+    child: const SizedBox.expand(),
+  );
+}
+
+class _FilterCoveragePainter extends CustomPainter {
+  const _FilterCoveragePainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..color = const Color.fromARGB(1, 0, 0, 0);
+    canvas.drawPoints(ui.PointMode.points, [
+      Offset.zero,
+      Offset(size.width - 1, 0),
+      Offset(0, size.height - 1),
+      Offset(size.width - 1, size.height - 1),
+    ], paint);
+  }
+
+  @override
+  bool shouldRepaint(_FilterCoveragePainter oldDelegate) => false;
+}
 
 class _FaceSkinClipper extends CustomClipper<Path> {
   const _FaceSkinClipper({

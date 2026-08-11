@@ -1,32 +1,36 @@
 import 'dart:async';
 import 'dart:isolate';
 import 'dart:typed_data';
-import 'dart:ui';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/services.dart';
 import 'package:glamar/features/face_mesh/utils/low_latency_face_mesh_tracker.dart';
 import 'package:glamar/features/face_mesh/utils/nv21_isolate_converter.dart';
+import 'package:glamar/features/makeup/models/face_render_context.dart';
 import 'package:mediapipe_face_mesh/mediapipe_face_mesh.dart';
+
+class FaceMeshInferenceSample {
+  const FaceMeshInferenceSample({required this.mesh, required this.lighting});
+
+  final FaceMeshResult? mesh;
+  final FaceLighting lighting;
+}
 
 /// 常驻后台推理 Isolate。相机帧只保留一个在途请求，UI Isolate 不再被 TFLite
 /// 和 YUV 转换阻塞。
 class FaceMeshInferenceWorker {
   FaceMeshInferenceWorker._({
-    required Isolate isolate,
-    required ReceivePort receivePort,
-    required SendPort commandPort,
-    required StreamSubscription<Object?> subscription,
-  }) : _isolate = isolate,
-       _receivePort = receivePort,
-       _commandPort = commandPort,
-       _subscription = subscription;
+    required this._isolate,
+    required this._receivePort,
+    required this._commandPort,
+    required this._subscription,
+  });
 
   final Isolate _isolate;
   final ReceivePort _receivePort;
   final SendPort _commandPort;
   final StreamSubscription<Object?> _subscription;
-  final Map<int, Completer<FaceMeshResult?>> _pending = {};
+  final Map<int, Completer<FaceMeshInferenceSample>> _pending = {};
   int _nextRequestId = 1;
   bool _closed = false;
 
@@ -81,14 +85,14 @@ class FaceMeshInferenceWorker {
     }
   }
 
-  Future<FaceMeshResult?> process(
+  Future<FaceMeshInferenceSample> process(
     CameraImage image, {
     required int rotationDegrees,
     required bool isAndroid,
   }) {
     if (_closed) throw StateError('Face Mesh worker 已关闭');
     final requestId = _nextRequestId++;
-    final completer = Completer<FaceMeshResult?>();
+    final completer = Completer<FaceMeshInferenceSample>();
     _pending[requestId] = completer;
     final planes = image.planes
         .map((plane) => TransferableTypedData.fromList([plane.bytes]))
@@ -147,7 +151,25 @@ class FaceMeshInferenceWorker {
       return;
     }
     final encoded = message['mesh'];
-    completer.complete(encoded is Map ? _decodeMesh(encoded) : null);
+    final lighting = _decodeLighting(message['lighting']);
+    completer.complete(
+      FaceMeshInferenceSample(
+        mesh: encoded is Map ? _decodeMesh(encoded) : null,
+        lighting: lighting,
+      ),
+    );
+  }
+
+  static FaceLighting _decodeLighting(Object? encoded) {
+    if (encoded is! Float32List || encoded.length < 4) {
+      return FaceLighting.neutral;
+    }
+    return FaceLighting(
+      exposure: encoded[0],
+      sideAExposure: encoded[1],
+      sideBExposure: encoded[2],
+      warmth: encoded[3],
+    );
   }
 
   static FaceMeshResult _decodeMesh(Map<dynamic, dynamic> encoded) {
@@ -200,7 +222,7 @@ Future<void> _faceMeshWorkerMain(List<Object?> bootstrap) async {
     return;
   }
 
-  final tracker = LowLatencyFaceMeshTracker(detector: detector, mesh: mesh);
+  final tracker = LowLatencyFaceMeshTracker(detector, mesh);
   resultPort.send(<String, Object>{
     'type': 'ready',
     'port': commandPort.sendPort,
@@ -217,11 +239,12 @@ Future<void> _faceMeshWorkerMain(List<Object?> bootstrap) async {
     if (type != 'process') continue;
     final id = rawMessage['id'] as int;
     try {
-      final result = _processWorkerFrame(rawMessage, tracker);
+      final sample = _processWorkerFrame(rawMessage, tracker);
       resultPort.send(<String, Object?>{
         'type': 'result',
         'id': id,
-        'mesh': result == null ? null : _encodeMesh(result),
+        'mesh': sample.mesh == null ? null : _encodeMesh(sample.mesh!),
+        'lighting': _encodeLighting(sample.lighting),
       });
     } catch (error) {
       tracker.reset();
@@ -278,7 +301,7 @@ Future<T> _createWithFallback<T>(
   throw StateError('无法初始化人脸模型：$lastError');
 }
 
-FaceMeshResult? _processWorkerFrame(
+({FaceMeshResult? mesh, FaceLighting lighting}) _processWorkerFrame(
   Map<dynamic, dynamic> message,
   LowLatencyFaceMeshTracker tracker,
 ) {
@@ -300,20 +323,34 @@ FaceMeshResult? _processWorkerFrame(
       rowStrides: rowStrides,
       pixelStrides: pixelStrides,
     );
-    if (image == null) return null;
-    return tracker.processNv21(image, rotationDegrees: rotation);
+    if (image == null) {
+      return (mesh: null, lighting: FaceLighting.neutral);
+    }
+    final mesh = tracker.processNv21(image, rotationDegrees: rotation);
+    return (
+      mesh: mesh,
+      lighting: mesh == null
+          ? FaceLighting.neutral
+          : _analyzeNv21Lighting(image, mesh, rotation),
+    );
   }
 
-  if (planes.isEmpty) return null;
-  return tracker.processBgra(
-    FaceMeshImage(
-      pixels: planes.first,
-      width: width,
-      height: height,
-      bytesPerRow: rowStrides.first,
-      pixelFormat: FaceMeshPixelFormat.bgra,
-    ),
-    rotationDegrees: rotation,
+  if (planes.isEmpty) {
+    return (mesh: null, lighting: FaceLighting.neutral);
+  }
+  final image = FaceMeshImage(
+    pixels: planes.first,
+    width: width,
+    height: height,
+    bytesPerRow: rowStrides.first,
+    pixelFormat: FaceMeshPixelFormat.bgra,
+  );
+  final mesh = tracker.processBgra(image, rotationDegrees: rotation);
+  return (
+    mesh: mesh,
+    lighting: mesh == null
+        ? FaceLighting.neutral
+        : _analyzeBgraLighting(image, mesh, rotation),
   );
 }
 
@@ -419,5 +456,128 @@ Map<String, Object> _encodeMesh(FaceMeshResult result) {
     'score': result.score,
     'imageWidth': result.imageWidth,
     'imageHeight': result.imageHeight,
+  };
+}
+
+Float32List _encodeLighting(FaceLighting lighting) => Float32List.fromList([
+  lighting.exposure,
+  lighting.sideAExposure,
+  lighting.sideBExposure,
+  lighting.warmth,
+]);
+
+FaceLighting _analyzeNv21Lighting(
+  FaceMeshNv21Image image,
+  FaceMeshResult mesh,
+  int rotation,
+) {
+  return _analyzeLighting(mesh, (x, y) {
+    final raw = _logicalToRaw(x, y, rotation);
+    final px = (raw.$1 * (image.width - 1)).round().clamp(0, image.width - 1);
+    final py = (raw.$2 * (image.height - 1)).round().clamp(0, image.height - 1);
+    final yIndex = py * image.yBytesPerRow + px;
+    if (yIndex < 0 || yIndex >= image.yPlane.length) return null;
+    final luma = ((image.yPlane[yIndex] - 16) / 219).clamp(0.0, 1.0);
+    final uvIndex = (py ~/ 2) * image.vuBytesPerRow + (px ~/ 2) * 2;
+    var warmth = 0.0;
+    if (uvIndex + 1 < image.vuPlane.length) {
+      final v = image.vuPlane[uvIndex];
+      final u = image.vuPlane[uvIndex + 1];
+      warmth = ((v - u) / 170).clamp(-1.0, 1.0);
+    }
+    return (luma: luma, warmth: warmth);
+  });
+}
+
+FaceLighting _analyzeBgraLighting(
+  FaceMeshImage image,
+  FaceMeshResult mesh,
+  int rotation,
+) {
+  return _analyzeLighting(mesh, (x, y) {
+    final raw = _logicalToRaw(x, y, rotation);
+    final px = (raw.$1 * (image.width - 1)).round().clamp(0, image.width - 1);
+    final py = (raw.$2 * (image.height - 1)).round().clamp(0, image.height - 1);
+    final index = py * image.bytesPerRow + px * 4;
+    if (index < 0 || index + 2 >= image.pixels.length) return null;
+    final blue = image.pixels[index] / 255;
+    final green = image.pixels[index + 1] / 255;
+    final red = image.pixels[index + 2] / 255;
+    final luma = red * 0.2126 + green * 0.7152 + blue * 0.0722;
+    return (luma: luma, warmth: ((red - blue) * 1.55).clamp(-1.0, 1.0));
+  });
+}
+
+FaceLighting _analyzeLighting(
+  FaceMeshResult mesh,
+  ({double luma, double warmth})? Function(double x, double y) sample,
+) {
+  final points = mesh.landmarks;
+  var minX = 1.0;
+  var maxX = 0.0;
+  var minY = 1.0;
+  var maxY = 0.0;
+  for (final point in points) {
+    minX = point.x < minX ? point.x : minX;
+    maxX = point.x > maxX ? point.x : maxX;
+    minY = point.y < minY ? point.y : minY;
+    maxY = point.y > maxY ? point.y : maxY;
+  }
+  final width = maxX - minX;
+  final height = maxY - minY;
+  if (width <= 0 || height <= 0) return FaceLighting.neutral;
+  minX += width * 0.12;
+  maxX -= width * 0.12;
+  minY += height * 0.16;
+  maxY -= height * 0.1;
+  final centerX = (minX + maxX) * 0.5;
+
+  var total = 0.0;
+  var warmth = 0.0;
+  var count = 0;
+  var leftTotal = 0.0;
+  var leftCount = 0;
+  var rightTotal = 0.0;
+  var rightCount = 0;
+  for (var row = 0; row < 9; row++) {
+    final y = minY + (maxY - minY) * (row + 0.5) / 9;
+    for (var column = 0; column < 11; column++) {
+      final x = minX + (maxX - minX) * (column + 0.5) / 11;
+      final dx = (x - centerX) / ((maxX - minX) * 0.5);
+      final dy = (y - (minY + maxY) * 0.5) / ((maxY - minY) * 0.5);
+      if (dx * dx + dy * dy > 0.92) continue;
+      final value = sample(x, y);
+      if (value == null) continue;
+      total += value.luma;
+      warmth += value.warmth;
+      count++;
+      if (x < centerX) {
+        leftTotal += value.luma;
+        leftCount++;
+      } else {
+        rightTotal += value.luma;
+        rightCount++;
+      }
+    }
+  }
+  if (count == 0) return FaceLighting.neutral;
+  final average = total / count;
+  final left = leftCount == 0 ? average : leftTotal / leftCount;
+  final right = rightCount == 0 ? average : rightTotal / rightCount;
+  final sideAOnLeft = points.length > 117 && points[117].x < centerX;
+  return FaceLighting(
+    exposure: average,
+    sideAExposure: sideAOnLeft ? left : right,
+    sideBExposure: sideAOnLeft ? right : left,
+    warmth: (warmth / count).clamp(-1.0, 1.0),
+  );
+}
+
+(double, double) _logicalToRaw(double x, double y, int rotation) {
+  return switch (rotation) {
+    90 => (y, 1 - x),
+    180 => (1 - x, 1 - y),
+    270 => (1 - y, x),
+    _ => (x, y),
   };
 }

@@ -1,70 +1,85 @@
 import 'package:flutter/material.dart';
-import 'package:glamar/features/face_mesh/utils/lip_landmark_indices.dart';
+import 'package:glamar/features/makeup/models/face_render_context.dart';
 import 'package:glamar/features/makeup/models/makeup_look.dart';
+import 'package:glamar/features/makeup/painters/makeup_painter_utils.dart';
 
 class LipstickPainter extends CustomPainter {
   const LipstickPainter({
     required this.landmarkPixels,
     required this.config,
     required this.finish,
+    this.renderContext = const FaceRenderContext.neutral(),
   });
 
-  /// 已映射到画布像素坐标的关键点（与预览 Stack 同尺寸）。
   final List<Offset> landmarkPixels;
   final MakeupLayerConfig config;
   final LipFinish finish;
+  final FaceRenderContext renderContext;
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (!config.enabled || landmarkPixels.length < 468) return;
+    if (!config.enabled || !MakeupPainterUtils.valid(landmarkPixels)) return;
 
-    Offset toOffset(int idx) => landmarkPixels[idx];
+    final lipPath = MakeupPainterUtils.lipPath(landmarkPixels);
+    final bounds = lipPath.getBounds();
+    final faceWidth = MakeupPainterUtils.faceWidth(landmarkPixels);
+    final color = renderContext.adaptColor(config.color);
+    final opacity = renderContext.centralOpacity;
+    final upperColor = Color.lerp(color, Colors.black, 0.13)!;
+    final lowerColor = Color.lerp(color, Colors.white, 0.055)!;
 
-    Path buildPath(List<int> indices) {
-      final path = Path();
-      final first = toOffset(indices[0]);
-      path.moveTo(first.dx, first.dy);
-      for (int i = 1; i < indices.length; i++) {
-        final pt = toOffset(indices[i]);
-        path.lineTo(pt.dx, pt.dy);
-      }
-      path.close();
-      return path;
-    }
-
-    final outerPath = buildPath(LipLandmarkIndices.outerLip);
-    final innerPath = buildPath(LipLandmarkIndices.innerLip);
-
-    final lipPath = Path.combine(
-      PathOperation.difference,
-      outerPath,
-      innerPath,
+    // 极轻的羽化底层只处理边界，不掩盖原有唇纹。
+    canvas.drawPath(
+      lipPath,
+      Paint()
+        ..color = color.withValues(alpha: config.intensity * opacity * 0.16)
+        ..blendMode = BlendMode.softLight
+        ..maskFilter = MaskFilter.blur(BlurStyle.normal, faceWidth * 0.0035),
     );
 
-    final fillPaint = Paint()
-      ..color = config.color.withValues(alpha: config.intensity * 0.72)
-      ..style = PaintingStyle.fill
-      ..blendMode = BlendMode.multiply;
+    canvas.drawPath(
+      lipPath,
+      Paint()
+        ..shader = LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [
+            upperColor.withValues(alpha: config.intensity * opacity * 0.46),
+            color.withValues(alpha: config.intensity * opacity * 0.36),
+            lowerColor.withValues(alpha: config.intensity * opacity * 0.3),
+          ],
+          stops: const [0, 0.46, 1],
+        ).createShader(bounds)
+        ..blendMode = BlendMode.multiply,
+    );
 
-    canvas.drawPath(lipPath, fillPaint);
+    canvas.drawPath(
+      lipPath,
+      Paint()
+        ..color = color.withValues(alpha: config.intensity * opacity * 0.1)
+        ..blendMode = BlendMode.color,
+    );
 
-    final edgePaint = Paint()
-      ..color = config.color.withValues(alpha: config.intensity * 0.22)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.2
-      ..blendMode = BlendMode.multiply;
-
-    canvas.drawPath(lipPath, edgePaint);
+    canvas.drawPath(
+      lipPath,
+      Paint()
+        ..color = upperColor.withValues(
+          alpha: config.intensity * opacity * 0.15,
+        )
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = faceWidth * 0.0022
+        ..strokeJoin = StrokeJoin.round
+        ..blendMode = BlendMode.multiply,
+    );
 
     if (finish != LipFinish.velvet) {
-      final bounds = lipPath.getBounds();
       canvas.save();
       canvas.clipPath(lipPath);
       final glossRect = Rect.fromLTWH(
-        bounds.left + bounds.width * 0.18,
-        bounds.top + bounds.height * 0.47,
-        bounds.width * 0.64,
-        bounds.height * 0.25,
+        bounds.left + bounds.width * 0.2,
+        bounds.top + bounds.height * 0.56,
+        bounds.width * 0.6,
+        bounds.height * 0.16,
       );
       canvas.drawOval(
         glossRect,
@@ -74,13 +89,14 @@ class LipstickPainter extends CustomPainter {
               Colors.white.withValues(
                 alpha:
                     config.intensity *
-                    (finish == LipFinish.glass ? 0.34 : 0.16),
+                    opacity *
+                    (finish == LipFinish.glass ? 0.2 : 0.075),
               ),
               Colors.transparent,
             ],
           ).createShader(glossRect)
           ..blendMode = BlendMode.screen
-          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 2.5),
+          ..maskFilter = MaskFilter.blur(BlurStyle.normal, faceWidth * 0.003),
       );
       canvas.restore();
     }
@@ -90,5 +106,6 @@ class LipstickPainter extends CustomPainter {
   bool shouldRepaint(LipstickPainter old) =>
       old.landmarkPixels != landmarkPixels ||
       old.config != config ||
-      old.finish != finish;
+      old.finish != finish ||
+      old.renderContext != renderContext;
 }

@@ -5,12 +5,11 @@ import 'package:mediapipe_face_mesh/mediapipe_face_mesh.dart';
 /// 原有 inference pipeline 每帧都会同时跑人脸检测器和 Face Mesh。这里仅在
 /// 首帧或跟踪置信度丢失时重检测，其余帧复用 Face Mesh 内部 ROI 跟踪状态。
 class LowLatencyFaceMeshTracker {
-  LowLatencyFaceMeshTracker({
-    required FaceDetectorProcessor detector,
-    required FaceMeshProcessor mesh,
+  LowLatencyFaceMeshTracker(
+    this._detector,
+    this._mesh, {
     this.minimumUsableScore = 0.48,
-  }) : _detector = detector,
-       _mesh = mesh;
+  });
 
   final FaceDetectorProcessor _detector;
   final FaceMeshProcessor _mesh;

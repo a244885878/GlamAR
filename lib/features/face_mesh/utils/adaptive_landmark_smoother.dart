@@ -67,11 +67,6 @@ class AdaptiveLandmarkSmoother {
     final previousAngle = _angle;
     final rawCenter = _average(raw, _poseAnchors);
     final rawScale = math.max(1.0, (raw[454] - raw[234]).distance);
-    final rawAngle = math.atan2(
-      raw[454].dy - raw[234].dy,
-      raw[454].dx - raw[234].dx,
-    );
-
     final centerSpeed = (rawCenter - previousCenter).distance / rawScale / dt;
     final poseResponse = (centerSpeed / 0.72).clamp(0.0, 1.0);
     final poseAlpha = 0.34 + poseResponse * 0.58;

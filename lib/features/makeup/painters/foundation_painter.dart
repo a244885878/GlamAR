@@ -1,18 +1,26 @@
 import 'package:flutter/material.dart';
+import 'package:glamar/features/makeup/models/face_render_context.dart';
 import 'package:glamar/features/makeup/models/makeup_look.dart';
 import 'package:glamar/features/makeup/painters/makeup_painter_utils.dart';
 
 class FoundationPainter extends CustomPainter {
-  const FoundationPainter({required this.landmarks, required this.config});
+  const FoundationPainter({
+    required this.landmarks,
+    required this.config,
+    this.renderContext = const FaceRenderContext.neutral(),
+  });
 
   final List<Offset> landmarks;
   final MakeupLayerConfig config;
+  final FaceRenderContext renderContext;
 
   @override
   void paint(Canvas canvas, Size size) {
     if (!config.enabled || !MakeupPainterUtils.valid(landmarks)) return;
     final faceWidth = MakeupPainterUtils.faceWidth(landmarks);
     final center = landmarks[1];
+    final color = renderContext.adaptColor(config.color);
+    final centralOpacity = renderContext.centralOpacity;
     final skinPath = MakeupPainterUtils.skinPath(
       landmarks,
       featurePadding: faceWidth * 0.018,
@@ -25,7 +33,9 @@ class FoundationPainter extends CustomPainter {
     canvas.drawPath(
       skinPath,
       Paint()
-        ..color = config.color.withValues(alpha: config.intensity * 0.105)
+        ..color = color.withValues(
+          alpha: config.intensity * centralOpacity * 0.105,
+        )
         ..blendMode = BlendMode.softLight,
     );
 
@@ -39,8 +49,10 @@ class FoundationPainter extends CustomPainter {
       Paint()
         ..shader = RadialGradient(
           colors: [
-            config.color.withValues(alpha: config.intensity * 0.07),
-            const Color(0xFFFFEDE4).withValues(alpha: config.intensity * 0.025),
+            color.withValues(alpha: config.intensity * centralOpacity * 0.07),
+            renderContext
+                .adaptColor(const Color(0xFFFFEDE4))
+                .withValues(alpha: config.intensity * centralOpacity * 0.025),
             Colors.transparent,
           ],
           stops: const [0, 0.7, 1],
@@ -49,8 +61,13 @@ class FoundationPainter extends CustomPainter {
     );
 
     // 对鼻翼与眼下做非常轻的提亮，模拟逐像素美颜中的肤色均衡层。
-    for (final anchor in <int>[117, 346]) {
+    for (final entry in <({int anchor, bool sideA})>[
+      (anchor: 117, sideA: true),
+      (anchor: 346, sideA: false),
+    ]) {
+      final anchor = entry.anchor;
       final underEye = landmarks[anchor];
+      final sideOpacity = renderContext.opacityForSide(sideA: entry.sideA);
       final correctionRect = Rect.fromCenter(
         center: Offset.lerp(underEye, center, 0.13)!,
         width: faceWidth * 0.25,
@@ -61,9 +78,12 @@ class FoundationPainter extends CustomPainter {
         Paint()
           ..shader = RadialGradient(
             colors: [
-              const Color(
-                0xFFFFE9DE,
-              ).withValues(alpha: config.intensity * config.detail * 0.055),
+              renderContext
+                  .adaptColor(const Color(0xFFFFE9DE))
+                  .withValues(
+                    alpha:
+                        config.intensity * config.detail * sideOpacity * 0.055,
+                  ),
               Colors.transparent,
             ],
           ).createShader(correctionRect)
@@ -72,9 +92,14 @@ class FoundationPainter extends CustomPainter {
       );
     }
 
-    final contourColor = Color.lerp(config.color, Colors.black, 0.72)!;
-    for (final anchor in <int>[127, 356]) {
+    final contourColor = Color.lerp(color, Colors.black, 0.72)!;
+    for (final entry in <({int anchor, bool sideA})>[
+      (anchor: 127, sideA: true),
+      (anchor: 356, sideA: false),
+    ]) {
+      final anchor = entry.anchor;
       final p = landmarks[anchor];
+      final sideOpacity = renderContext.opacityForSide(sideA: entry.sideA);
       final rect = Rect.fromCenter(
         center: Offset(
           p.dx + (center.dx - p.dx) * 0.08,
@@ -87,7 +112,7 @@ class FoundationPainter extends CustomPainter {
         rect,
         Paint()
           ..color = contourColor.withValues(
-            alpha: config.intensity * config.detail * 0.11,
+            alpha: config.intensity * config.detail * sideOpacity * 0.11,
           )
           ..blendMode = BlendMode.multiply
           ..maskFilter = MaskFilter.blur(BlurStyle.normal, faceWidth * 0.045),
@@ -95,9 +120,14 @@ class FoundationPainter extends CustomPainter {
     }
 
     final highlightPaint = Paint()
-      ..color = const Color(
-        0xFFFFEEE4,
-      ).withValues(alpha: config.intensity * (0.09 + config.detail * 0.05))
+      ..color = renderContext
+          .adaptColor(const Color(0xFFFFEEE4))
+          .withValues(
+            alpha:
+                config.intensity *
+                renderContext.highlightOpacity *
+                (0.09 + config.detail * 0.05),
+          )
       ..blendMode = BlendMode.screen
       ..strokeCap = StrokeCap.round
       ..maskFilter = MaskFilter.blur(BlurStyle.normal, faceWidth * 0.018);
@@ -112,5 +142,7 @@ class FoundationPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(FoundationPainter oldDelegate) =>
-      oldDelegate.landmarks != landmarks || oldDelegate.config != config;
+      oldDelegate.landmarks != landmarks ||
+      oldDelegate.config != config ||
+      oldDelegate.renderContext != renderContext;
 }

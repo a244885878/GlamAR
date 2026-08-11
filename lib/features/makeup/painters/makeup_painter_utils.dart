@@ -108,6 +108,54 @@ abstract final class MakeupPainterUtils {
     return path..close();
   }
 
+  static Path smoothClosedPath(List<Offset> points, List<int> indices) {
+    if (indices.length < 3) return closedPath(points, indices);
+    final path = Path();
+    final first = points[indices.first];
+    final second = points[indices[1]];
+    path.moveTo((first.dx + second.dx) / 2, (first.dy + second.dy) / 2);
+    for (var index = 1; index <= indices.length; index++) {
+      final current = points[indices[index % indices.length]];
+      final next = points[indices[(index + 1) % indices.length]];
+      path.quadraticBezierTo(
+        current.dx,
+        current.dy,
+        (current.dx + next.dx) / 2,
+        (current.dy + next.dy) / 2,
+      );
+    }
+    return path..close();
+  }
+
+  static Path smoothClosedOffsets(List<Offset> points) {
+    if (points.length < 3) {
+      final path = Path();
+      if (points.isNotEmpty) path.moveTo(points.first.dx, points.first.dy);
+      return path;
+    }
+    final path = Path();
+    final first = points.first;
+    final second = points[1];
+    path.moveTo((first.dx + second.dx) / 2, (first.dy + second.dy) / 2);
+    for (var index = 1; index <= points.length; index++) {
+      final current = points[index % points.length];
+      final next = points[(index + 1) % points.length];
+      path.quadraticBezierTo(
+        current.dx,
+        current.dy,
+        (current.dx + next.dx) / 2,
+        (current.dy + next.dy) / 2,
+      );
+    }
+    return path..close();
+  }
+
+  static Path lipPath(List<Offset> points) {
+    final outer = smoothClosedPath(points, LipLandmarkIndices.outerLip);
+    final inner = smoothClosedPath(points, LipLandmarkIndices.innerLip);
+    return Path.combine(PathOperation.difference, outer, inner);
+  }
+
   /// 面部皮肤蒙版：保留脸部轮廓，同时挖掉眼睛和嘴唇，供底妆与像素柔化共用。
   static Path skinPath(List<Offset> points, {double featurePadding = 0}) {
     final face = closedPath(points, faceOval);
@@ -116,8 +164,17 @@ abstract final class MakeupPainterUtils {
       final eye = closedPath(points, eyeIndices);
       protectedFeatures.addOval(eye.getBounds().inflate(featurePadding));
     }
+    for (final browIndices in <List<int>>[leftBrow, rightBrow]) {
+      final brow = smoothOpenPath(points, browIndices);
+      protectedFeatures.addRRect(
+        RRect.fromRectAndRadius(
+          brow.getBounds().inflate(featurePadding * 0.72),
+          Radius.circular(featurePadding),
+        ),
+      );
+    }
     protectedFeatures.addPath(
-      closedPath(points, LipLandmarkIndices.outerLip),
+      smoothClosedPath(points, LipLandmarkIndices.outerLip),
       Offset.zero,
     );
     return Path.combine(PathOperation.difference, face, protectedFeatures);

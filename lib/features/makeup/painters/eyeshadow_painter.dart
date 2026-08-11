@@ -1,34 +1,50 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
+import 'package:glamar/features/makeup/models/face_render_context.dart';
 import 'package:glamar/features/makeup/models/makeup_look.dart';
 import 'package:glamar/features/makeup/painters/makeup_painter_utils.dart';
 
 class EyeshadowPainter extends CustomPainter {
-  const EyeshadowPainter({required this.landmarks, required this.config});
+  const EyeshadowPainter({
+    required this.landmarks,
+    required this.config,
+    this.renderContext = const FaceRenderContext.neutral(),
+  });
 
   final List<Offset> landmarks;
   final MakeupLayerConfig config;
+  final FaceRenderContext renderContext;
 
   Path _lidPath(List<int> indices, double lift) {
     final eyePoints = indices.map((i) => landmarks[i]).toList(growable: false);
-    final path = Path()..moveTo(eyePoints.first.dx, eyePoints.first.dy);
-    for (final p in eyePoints.skip(1)) {
-      path.lineTo(p.dx, p.dy);
-    }
-    for (final p in eyePoints.reversed) {
-      path.lineTo(p.dx, p.dy - lift);
-    }
-    return path..close();
+    final axis = eyePoints.last - eyePoints.first;
+    var normal = Offset(-axis.dy, axis.dx) / math.max(axis.distance, 0.001);
+    if (normal.dy > 0) normal = -normal;
+    final lifted = eyePoints.reversed
+        .map((point) => point + normal * lift)
+        .toList(growable: false);
+    return MakeupPainterUtils.smoothClosedOffsets([...eyePoints, ...lifted]);
   }
 
   @override
   void paint(Canvas canvas, Size size) {
     if (!config.enabled || !MakeupPainterUtils.valid(landmarks)) return;
     final width = MakeupPainterUtils.faceWidth(landmarks);
-    final lift = width * (0.045 + config.detail * 0.035);
-    for (final indices in <List<int>>[
-      MakeupPainterUtils.leftEyeUpper,
-      MakeupPainterUtils.rightEyeUpper,
+    final roll = MakeupPainterUtils.angle(landmarks[234], landmarks[454]);
+    final color = renderContext.adaptColor(config.color);
+    final secondaryColor = renderContext.adaptColor(
+      config.secondaryColor ?? config.color,
+    );
+    for (final eye in <({List<int> indices, bool sideA})>[
+      (indices: MakeupPainterUtils.leftEyeUpper, sideA: true),
+      (indices: MakeupPainterUtils.rightEyeUpper, sideA: false),
     ]) {
+      final indices = eye.indices;
+      final opacity = renderContext.opacityForSide(sideA: eye.sideA);
+      final eyeWidth =
+          (landmarks[indices.last] - landmarks[indices.first]).distance;
+      final lift = eyeWidth * (0.2 + config.detail * 0.14);
       final path = _lidPath(indices, lift);
       final bounds = path.getBounds();
       canvas.drawPath(
@@ -38,37 +54,82 @@ class EyeshadowPainter extends CustomPainter {
             begin: Alignment.bottomCenter,
             end: Alignment.topCenter,
             colors: [
-              config.color.withValues(alpha: config.intensity * 0.46),
-              (config.secondaryColor ?? config.color).withValues(
-                alpha: config.intensity * 0.22,
+              Color.lerp(
+                color,
+                Colors.black,
+                0.16,
+              )!.withValues(alpha: config.intensity * opacity * 0.34),
+              color.withValues(alpha: config.intensity * opacity * 0.24),
+              secondaryColor.withValues(
+                alpha: config.intensity * opacity * 0.1,
               ),
               Colors.transparent,
             ],
+            stops: const [0, 0.28, 0.7, 1],
           ).createShader(bounds)
           ..blendMode = BlendMode.softLight
-          ..maskFilter = MaskFilter.blur(BlurStyle.normal, width * 0.008),
+          ..maskFilter = MaskFilter.blur(BlurStyle.normal, width * 0.006),
+      );
+
+      final lashLine = MakeupPainterUtils.smoothOpenPath(landmarks, indices);
+      canvas.drawPath(
+        lashLine,
+        Paint()
+          ..color = Color.lerp(
+            color,
+            Colors.black,
+            0.38,
+          )!.withValues(alpha: config.intensity * opacity * 0.18)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = width * 0.005
+          ..strokeCap = StrokeCap.round
+          ..blendMode = BlendMode.multiply
+          ..maskFilter = MaskFilter.blur(BlurStyle.normal, width * 0.003),
       );
 
       if (config.detail > 0.62) {
-        final shimmer = Paint()
-          ..color = const Color(
-            0xFFFFE4D1,
-          ).withValues(alpha: config.intensity * 0.48)
-          ..blendMode = BlendMode.screen
-          ..maskFilter = MaskFilter.blur(BlurStyle.normal, width * 0.003);
-        for (var i = 2; i < indices.length - 2; i += 2) {
-          final p = landmarks[indices[i]];
-          canvas.drawCircle(
-            Offset(p.dx, p.dy - lift * 0.38),
-            width * 0.0045,
-            shimmer,
-          );
-        }
+        final shimmerCenter = Offset(
+          bounds.center.dx,
+          bounds.top + bounds.height * 0.52,
+        );
+        final shimmerRect = Rect.fromCenter(
+          center: shimmerCenter,
+          width: bounds.width * 0.38,
+          height: bounds.height * 0.24,
+        );
+        canvas.save();
+        canvas.clipPath(path);
+        canvas.translate(shimmerCenter.dx, shimmerCenter.dy);
+        canvas.rotate(roll);
+        canvas.translate(-shimmerCenter.dx, -shimmerCenter.dy);
+        canvas.drawOval(
+          shimmerRect,
+          Paint()
+            ..shader = RadialGradient(
+              colors: [
+                renderContext
+                    .adaptColor(const Color(0xFFFFE4D1))
+                    .withValues(
+                      alpha:
+                          config.intensity *
+                          opacity *
+                          renderContext.highlightOpacity *
+                          0.22,
+                    ),
+                Colors.transparent,
+              ],
+            ).createShader(shimmerRect)
+            ..blendMode = BlendMode.screen
+            ..maskFilter = MaskFilter.blur(BlurStyle.normal, width * 0.004),
+        );
+        canvas.restore();
       }
     }
   }
 
   @override
   bool shouldRepaint(EyeshadowPainter oldDelegate) =>
-      oldDelegate.landmarks != landmarks || oldDelegate.config != config;
+      oldDelegate.landmarks != landmarks ||
+      oldDelegate.config != config ||
+      oldDelegate.renderContext != renderContext;
 }
