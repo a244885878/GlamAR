@@ -1,18 +1,24 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:gal/gal.dart';
 import 'package:glamar/app/theme/glamar_theme.dart';
-import 'package:glamar/features/face_mesh/painters/lipstick_painter.dart';
 import 'package:glamar/features/face_mesh/utils/face_mesh_camera_image_adapter.dart';
-import 'package:glamar/features/face_mesh/utils/landmark_smoother.dart';
-import 'package:glamar/features/face_mesh/utils/lip_landmark_indices.dart';
+import 'package:glamar/features/face_mesh/utils/adaptive_landmark_smoother.dart';
+import 'package:glamar/features/makeup/models/makeup_look.dart';
+import 'package:glamar/features/makeup/painters/makeup_renderer.dart';
+import 'package:glamar/features/makeup/widgets/makeup_control_dock.dart';
 import 'package:mediapipe_face_mesh/face_mesh_painter.dart';
 import 'package:mediapipe_face_mesh/mediapipe_face_mesh.dart';
+
 class FaceMeshCameraPage extends StatefulWidget {
-  const FaceMeshCameraPage({super.key});
+  const FaceMeshCameraPage({super.key, required this.initialLook});
+
+  final MakeupLook initialLook;
 
   @override
   State<FaceMeshCameraPage> createState() => _FaceMeshCameraPageState();
@@ -44,30 +50,31 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   bool _isModelReady = false;
   bool _inferBusy = false;
   CameraImage? _pendingCameraImage;
-  bool _showSkeleton = true;
-  double _inferenceFps = 0;
+  bool _showSkeleton = false;
   String _statusMessage = '正在启动相机...';
   Size _paintSize = Size.zero;
 
-  // 口红状态
-  Color? _lipstickColor = const Color(0xFFCC2929);
-  final ValueNotifier<List<Offset>?> _lipstickLandmarks =
+  final ValueNotifier<List<Offset>?> _makeupLandmarks =
       ValueNotifier<List<Offset>?>(null);
-  late final LipLandmarkSmoother _lipSmoother = LipLandmarkSmoother(
-    alpha: Platform.isAndroid ? 0.95 : 0.75,
-    lipIndices: LipLandmarkIndices.all,
-  );
+  final AdaptiveLandmarkSmoother _landmarkSmoother = AdaptiveLandmarkSmoother();
+  late MakeupLook _activeLook;
+  late MakeupLook _presetLook;
+  MakeupPart _selectedPart = MakeupPart.lips;
+  bool _panelExpanded = false;
+  bool _makeupVisible = true;
+  bool _isCapturing = false;
+  bool _showCaptureFlash = false;
 
   /// 库默认 0.5。Android 略提高：跟踪置信度不足时更快触发重检测，转头更跟手。
   double get _meshMinTrackingConfidence => Platform.isAndroid ? 0.65 : 0.5;
 
-  DateTime? _lastInferenceTime;
-  DateTime? _lastFpsUpdate;
   DateTime? _lastHudUpdate;
 
   @override
   void initState() {
     super.initState();
+    _activeLook = widget.initialLook;
+    _presetLook = widget.initialLook;
     WidgetsBinding.instance.addObserver(this);
     _bootstrap();
   }
@@ -118,10 +125,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       _detector = await _createDetectorProcessor();
       _meshProcessor = await _createMeshProcessor();
       _streamProcessor = FaceMeshInferenceStreamProcessor(
-        FaceMeshInferencePipeline(
-          detector: _detector!,
-          mesh: _meshProcessor!,
-        ),
+        FaceMeshInferencePipeline(detector: _detector!, mesh: _meshProcessor!),
       );
       if (mounted) {
         setState(() {
@@ -247,13 +251,12 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
 
   void _onInferenceResult(FaceMeshInferenceResult result) {
     _inferBusy = false;
-    _updateInferenceFps();
-
     final mesh = result.meshResult;
     _updateTrackedLandmarks(mesh);
 
     final now = DateTime.now();
-    final shouldRefreshHud = _lastHudUpdate == null ||
+    final shouldRefreshHud =
+        _lastHudUpdate == null ||
         now.difference(_lastHudUpdate!) >= const Duration(milliseconds: 250);
 
     final refreshSkeleton = _showSkeleton && mesh != null;
@@ -275,18 +278,17 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
 
   void _updateTrackedLandmarks(FaceMeshResult? mesh) {
     if (mesh == null || _paintSize == Size.zero) {
-      _lipSmoother.reset();
-      _lipstickLandmarks.value = null;
+      _landmarkSmoother.reset();
+      _makeupLandmarks.value = null;
       return;
     }
 
-    final pixels = _lipSmoother.smoothToPixelOffsets(
+    final pixels = _landmarkSmoother.smoothToPixelOffsets(
       mesh: mesh,
       targetSize: _paintSize,
-      rotationDegrees: 0,
       mirrorHorizontal: _mirrorHorizontal,
     );
-    _lipstickLandmarks.value = pixels;
+    _makeupLandmarks.value = pixels;
   }
 
   void _onInferenceError(Object error) {
@@ -295,25 +297,6 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       setState(() => _errorMessage ??= '$error');
     }
     unawaited(_processLatestFrame());
-  }
-
-  void _updateInferenceFps() {
-    final now = DateTime.now();
-    final prev = _lastInferenceTime;
-    _lastInferenceTime = now;
-    if (prev == null) {
-      return;
-    }
-    final elapsed = now.difference(prev).inMicroseconds;
-    if (elapsed <= 0) {
-      return;
-    }
-    if (_lastFpsUpdate != null &&
-        now.difference(_lastFpsUpdate!) < const Duration(milliseconds: 400)) {
-      return;
-    }
-    _lastFpsUpdate = now;
-    _inferenceFps = 1000000 / elapsed;
   }
 
   void _onCameraFrame(CameraImage image) {
@@ -330,7 +313,9 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     }
     final image = _pendingCameraImage;
     final controller = _cameraController;
-    if (image == null || controller == null || !controller.value.isInitialized) {
+    if (image == null ||
+        controller == null ||
+        !controller.value.isInitialized) {
       return;
     }
 
@@ -424,9 +409,10 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       _isModelReady = false;
       _meshResult = null;
       _landmarkCount = 0;
-      _lipSmoother.reset();
-      _lipstickLandmarks.value = null;
-    } else if (state == AppLifecycleState.resumed && _cameraController == null) {
+      _landmarkSmoother.reset();
+      _makeupLandmarks.value = null;
+    } else if (state == AppLifecycleState.resumed &&
+        _cameraController == null) {
       setState(() {
         _isInitializing = true;
         _errorMessage = null;
@@ -442,7 +428,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     _cameraController?.dispose();
     _detector?.close();
     _meshProcessor?.close();
-    _lipstickLandmarks.dispose();
+    _makeupLandmarks.dispose();
     super.dispose();
   }
 
@@ -450,6 +436,140 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     final controller = _cameraController;
     return !Platform.isIOS &&
         controller?.description.lensDirection == CameraLensDirection.front;
+  }
+
+  Future<void> _capturePhoto() async {
+    final controller = _cameraController;
+    final mesh = _meshResult;
+    if (_isCapturing || controller == null || !controller.value.isInitialized) {
+      return;
+    }
+    if (mesh == null) {
+      _showMessage('请先将面部置于画面中央');
+      return;
+    }
+
+    setState(() => _isCapturing = true);
+    try {
+      _stopInferenceStream();
+      if (controller.value.isStreamingImages) {
+        await controller.stopImageStream();
+      }
+      final file = await controller.takePicture();
+      final sourceBytes = await file.readAsBytes();
+      final codec = await ui.instantiateImageCodec(sourceBytes);
+      final frame = await codec.getNextFrame();
+      final source = frame.image;
+      final targetSize = Size(
+        source.width.toDouble(),
+        source.height.toDouble(),
+      );
+      final mirrorPhoto = _mirrorHorizontal;
+
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(recorder);
+      canvas.save();
+      if (mirrorPhoto) {
+        canvas.translate(targetSize.width, 0);
+        canvas.scale(-1, 1);
+      }
+      canvas.drawImageRect(
+        source,
+        Rect.fromLTWH(0, 0, source.width.toDouble(), source.height.toDouble()),
+        Offset.zero & targetSize,
+        Paint()..filterQuality = FilterQuality.high,
+      );
+      canvas.restore();
+
+      if (_makeupVisible) {
+        final photoLandmarks = List<Offset>.generate(mesh.landmarks.length, (
+          index,
+        ) {
+          return mesh.landmarkAsOffset(
+            mesh.landmarks[index],
+            targetSize: targetSize,
+            rotationDegrees: 0,
+            mirrorHorizontal: mirrorPhoto,
+          );
+        }, growable: false);
+        MakeupRenderer.paintAll(
+          canvas,
+          targetSize,
+          photoLandmarks,
+          _activeLook,
+        );
+      }
+
+      final picture = recorder.endRecording();
+      final rendered = await picture.toImage(source.width, source.height);
+      final byteData = await rendered.toByteData(
+        format: ui.ImageByteFormat.png,
+      );
+      if (byteData == null) throw StateError('照片编码失败');
+      var hasAccess = await Gal.hasAccess(toAlbum: true);
+      if (!hasAccess) hasAccess = await Gal.requestAccess(toAlbum: true);
+      if (!hasAccess) throw StateError('未获得相册写入权限');
+      await Gal.putImageBytes(
+        byteData.buffer.asUint8List(),
+        album: 'GlamAR',
+        name: 'GlamAR_${DateTime.now().millisecondsSinceEpoch}',
+      );
+      codec.dispose();
+      source.dispose();
+      rendered.dispose();
+      if (mounted) {
+        setState(() => _showCaptureFlash = true);
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        if (mounted) setState(() => _showCaptureFlash = false);
+        _showMessage('妆容照片已保存到相册');
+      }
+    } on CameraException catch (error) {
+      _showMessage('拍照失败：${error.description ?? error.code}');
+    } on GalException catch (error) {
+      _showMessage('保存失败：${error.type.message}');
+    } catch (error) {
+      _showMessage('拍照失败：$error');
+    } finally {
+      if (mounted &&
+          _cameraController == controller &&
+          controller.value.isInitialized) {
+        try {
+          await controller.startImageStream(_onCameraFrame);
+        } catch (_) {
+          // 生命周期切换时相机可能已经释放，resume 会重新初始化。
+        }
+      }
+      if (mounted) setState(() => _isCapturing = false);
+    }
+  }
+
+  void _showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: const Color(0xE81B171C),
+        ),
+      );
+  }
+
+  void _updateLayer(MakeupLayerConfig layer) {
+    setState(() => _activeLook = _activeLook.withLayer(_selectedPart, layer));
+  }
+
+  void _resetSelectedPart() {
+    setState(() {
+      _activeLook = _activeLook.withLayer(
+        _selectedPart,
+        _presetLook.layer(_selectedPart),
+      );
+      if (_selectedPart == MakeupPart.lips) {
+        _activeLook = _activeLook.withLipFinish(_presetLook.lipFinish);
+      }
+    });
   }
 
   @override
@@ -511,19 +631,19 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                           fit: StackFit.expand,
                           children: [
                             CameraPreview(controller),
-                            if (_lipstickColor != null)
+                            if (_makeupVisible)
                               RepaintBoundary(
                                 child: ListenableBuilder(
-                                  listenable: _lipstickLandmarks,
+                                  listenable: _makeupLandmarks,
                                   builder: (context, _) {
-                                    final pixels = _lipstickLandmarks.value;
+                                    final pixels = _makeupLandmarks.value;
                                     if (pixels == null) {
                                       return const SizedBox.shrink();
                                     }
                                     return CustomPaint(
-                                      painter: LipstickPainter(
-                                        landmarkPixels: pixels,
-                                        color: _lipstickColor!,
+                                      painter: _FullMakeupPainter(
+                                        landmarks: pixels,
+                                        look: _activeLook,
                                       ),
                                     );
                                   },
@@ -557,18 +677,32 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
             },
           ),
         ),
-        _TopBar(onBack: () => Navigator.of(context).pop()),
-        _LipstickPalette(
-          selected: _lipstickColor,
-          onSelect: (color) => setState(() => _lipstickColor = color),
+        _TopBar(
+          title: _activeLook.name,
+          subtitle: _activeLook.subtitle,
+          onBack: () => Navigator.of(context).pop(),
+          onChangeLook: () => Navigator.of(context).pop(),
+          onDebug: () => setState(() => _showSkeleton = !_showSkeleton),
         ),
-        _BottomHud(
-          landmarkCount: _landmarkCount,
-          fps: _inferenceFps,
-          showSkeleton: _showSkeleton,
-          onToggleSkeleton: () {
-            setState(() => _showSkeleton = !_showSkeleton);
-          },
+        Align(
+          alignment: Alignment.bottomCenter,
+          child: MakeupControlDock(
+            look: _activeLook,
+            selectedPart: _selectedPart,
+            expanded: _panelExpanded,
+            makeupVisible: _makeupVisible,
+            isCapturing: _isCapturing,
+            onToggleExpanded: () =>
+                setState(() => _panelExpanded = !_panelExpanded),
+            onSelectPart: (part) => setState(() => _selectedPart = part),
+            onLayerChanged: _updateLayer,
+            onLipFinishChanged: (finish) =>
+                setState(() => _activeLook = _activeLook.withLipFinish(finish)),
+            onResetPart: _resetSelectedPart,
+            onToggleMakeup: () =>
+                setState(() => _makeupVisible = !_makeupVisible),
+            onCapture: _capturePhoto,
+          ),
         ),
         if (!_isModelReady && _statusMessage.isNotEmpty)
           Positioned(
@@ -578,13 +712,15 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
             child: _ModelLoadingBanner(message: _statusMessage),
           ),
         if (_isModelReady && _landmarkCount == 0)
-          const Positioned(
+          Positioned(
             left: 0,
             right: 0,
-            bottom: 140,
-            child: Center(
-              child: _HintChip(text: '请将面部置于画面中央'),
-            ),
+            bottom: _panelExpanded ? 354 : 112,
+            child: const Center(child: _HintChip(text: '请将面部置于画面中央')),
+          ),
+        if (_showCaptureFlash)
+          const Positioned.fill(
+            child: IgnorePointer(child: ColoredBox(color: Colors.white)),
           ),
       ],
     );
@@ -670,9 +806,19 @@ class _ModelLoadingBanner extends StatelessWidget {
 }
 
 class _TopBar extends StatelessWidget {
-  const _TopBar({required this.onBack});
+  const _TopBar({
+    required this.title,
+    required this.subtitle,
+    required this.onBack,
+    required this.onChangeLook,
+    required this.onDebug,
+  });
 
+  final String title;
+  final String subtitle;
   final VoidCallback onBack;
+  final VoidCallback onChangeLook;
+  final VoidCallback onDebug;
 
   @override
   Widget build(BuildContext context) {
@@ -690,8 +836,46 @@ class _TopBar extends StatelessWidget {
                 icon: const Icon(Icons.arrow_back_ios_new, size: 20),
                 color: GlamARColors.pearl,
               ),
-              const Spacer(),
-              const _HintChip(text: '16:9'),
+              const SizedBox(width: 6),
+              Expanded(
+                child: GestureDetector(
+                  onLongPress: onDebug,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                          color: GlamARColors.pearl,
+                        ),
+                      ),
+                      Text(
+                        subtitle.toUpperCase(),
+                        style: const TextStyle(
+                          fontSize: 8,
+                          letterSpacing: 1.6,
+                          color: GlamARColors.rose,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              TextButton.icon(
+                onPressed: onChangeLook,
+                icon: const Icon(Icons.grid_view_rounded, size: 15),
+                label: const Text('换妆'),
+                style: TextButton.styleFrom(
+                  foregroundColor: GlamARColors.champagne,
+                  backgroundColor: Colors.black.withValues(alpha: 0.38),
+                  textStyle: const TextStyle(fontSize: 11),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
             ],
           ),
         ),
@@ -700,6 +884,23 @@ class _TopBar extends StatelessWidget {
   }
 }
 
+class _FullMakeupPainter extends CustomPainter {
+  const _FullMakeupPainter({required this.landmarks, required this.look});
+
+  final List<Offset> landmarks;
+  final MakeupLook look;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    MakeupRenderer.paintAll(canvas, size, landmarks, look);
+  }
+
+  @override
+  bool shouldRepaint(_FullMakeupPainter oldDelegate) =>
+      oldDelegate.landmarks != landmarks || oldDelegate.look != look;
+}
+
+// ignore: unused_element
 class _BottomHud extends StatelessWidget {
   const _BottomHud({
     required this.landmarkCount,
@@ -840,11 +1041,9 @@ class _HintChip extends StatelessWidget {
   }
 }
 
+// ignore: unused_element
 class _LipstickPalette extends StatelessWidget {
-  const _LipstickPalette({
-    required this.selected,
-    required this.onSelect,
-  });
+  const _LipstickPalette({required this.selected, required this.onSelect});
 
   final Color? selected;
   final ValueChanged<Color?> onSelect;
@@ -893,9 +1092,7 @@ class _LipstickPalette extends StatelessWidget {
                     children: _presets.map((preset) {
                       final isSelected = selected == preset.color;
                       return GestureDetector(
-                        onTap: () => onSelect(
-                          isSelected ? null : preset.color,
-                        ),
+                        onTap: () => onSelect(isSelected ? null : preset.color),
                         child: AnimatedContainer(
                           duration: const Duration(milliseconds: 180),
                           width: 32,
@@ -912,7 +1109,9 @@ class _LipstickPalette extends StatelessWidget {
                             boxShadow: isSelected
                                 ? [
                                     BoxShadow(
-                                      color: preset.color.withValues(alpha: 0.6),
+                                      color: preset.color.withValues(
+                                        alpha: 0.6,
+                                      ),
                                       blurRadius: 8,
                                       spreadRadius: 1,
                                     ),
@@ -935,9 +1134,7 @@ class _LipstickPalette extends StatelessWidget {
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
                       border: Border.all(
-                        color: selected == null
-                            ? Colors.white
-                            : Colors.white30,
+                        color: selected == null ? Colors.white : Colors.white30,
                         width: 2,
                       ),
                     ),
@@ -976,9 +1173,9 @@ class _ErrorView extends StatelessWidget {
             Text(
               message,
               textAlign: TextAlign.center,
-              style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                color: GlamARColors.champagne,
-              ),
+              style: Theme.of(
+                context,
+              ).textTheme.bodyLarge?.copyWith(color: GlamARColors.champagne),
             ),
             const SizedBox(height: 32),
             OutlinedButton(

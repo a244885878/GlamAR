@@ -28,6 +28,10 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>需要访问相机以实现 AR 美妆与人脸追踪功能</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>需要写入相册以保存你的 AR 妆容照片</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>需要访问相册以将照片保存到 GlamAR 相册</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

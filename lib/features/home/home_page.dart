@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:glamar/app/theme/glamar_theme.dart';
-import 'package:glamar/features/face_mesh/face_mesh_camera_page.dart';
+import 'package:glamar/features/catalog/category_page.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -40,12 +40,9 @@ class _HomePageState extends State<HomePage>
     Navigator.of(context).push(
       PageRouteBuilder<void>(
         pageBuilder: (context, animation, secondaryAnimation) =>
-            const FaceMeshCameraPage(),
+            const CategoryPage(),
         transitionsBuilder: (context, animation, secondaryAnimation, child) {
-          return FadeTransition(
-            opacity: animation,
-            child: child,
-          );
+          return FadeTransition(opacity: animation, child: child);
         },
         transitionDuration: const Duration(milliseconds: 400),
       ),
@@ -83,7 +80,7 @@ class _HomePageState extends State<HomePage>
                       ),
                       const SizedBox(height: 16),
                       Text(
-                        '实时捕捉面部轮廓，以 AR 骨骼网格\n为美妆叠加铺就精准画布。',
+                        '从 20 套当季妆容中选择灵感，\n让六层 AR 妆效自然贴合你的表情。',
                         style: textTheme.bodyMedium,
                       ),
                       const SizedBox(height: 40),
@@ -93,7 +90,9 @@ class _HomePageState extends State<HomePage>
                         child: Text(
                           '需要前置摄像头权限',
                           style: textTheme.bodySmall?.copyWith(
-                            color: GlamARColors.champagne.withValues(alpha: 0.4),
+                            color: GlamARColors.champagne.withValues(
+                              alpha: 0.4,
+                            ),
                             letterSpacing: 0.8,
                           ),
                         ),
@@ -138,7 +137,11 @@ class _BrandMark extends StatelessWidget {
               ),
             ],
           ),
-          child: const Icon(Icons.auto_awesome, size: 18, color: GlamARColors.ink),
+          child: const Icon(
+            Icons.auto_awesome,
+            size: 18,
+            color: GlamARColors.ink,
+          ),
         ),
         const SizedBox(width: 12),
         Text(
@@ -222,7 +225,7 @@ class _StartButtonState extends State<_StartButton>
             borderRadius: BorderRadius.circular(28),
             child: Center(
               child: Text(
-                '开启 AR 试妆镜',
+                '探索 20 套精选妆容',
                 style: Theme.of(context).textTheme.labelLarge?.copyWith(
                   color: GlamARColors.ink,
                   fontSize: 15,
@@ -253,10 +256,7 @@ class _AmbientPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final rect = Offset.zero & size;
 
-    canvas.drawRect(
-      rect,
-      Paint()..color = GlamARColors.ink,
-    );
+    canvas.drawRect(rect, Paint()..color = GlamARColors.ink);
 
     final roseGlow = Paint()
       ..shader = RadialGradient(
