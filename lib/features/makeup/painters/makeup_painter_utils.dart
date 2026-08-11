@@ -165,9 +165,54 @@ abstract final class MakeupPainterUtils {
 
   static Path lipPath(List<Offset> points) {
     final outer = smoothClosedPath(points, LipLandmarkIndices.outerLip);
-    final inner = smoothClosedPath(points, LipLandmarkIndices.innerLip);
+    final mouthWidth = math.max(0.001, (points[291] - points[61]).distance);
+    final openingRatio = (points[14] - points[13]).distance / mouthWidth;
+    final cutoutScale = _smoothStep(0.012, 0.052, openingRatio);
+    if (cutoutScale <= 0) return outer;
+    final inner = cutoutScale >= 0.999
+        ? smoothClosedPath(points, LipLandmarkIndices.innerLip)
+        : _verticallyScaledClosedPath(
+            points,
+            LipLandmarkIndices.innerLip,
+            seamY: (points[13].dy + points[14].dy) * 0.5,
+            scale: cutoutScale,
+          );
     return Path.combine(PathOperation.difference, outer, inner);
   }
+
+  static Path _verticallyScaledClosedPath(
+    List<Offset> points,
+    List<int> indices, {
+    required double seamY,
+    required double scale,
+  }) {
+    final path = Path();
+    final first = _verticalPoint(points[indices.first], seamY, scale);
+    final second = _verticalPoint(points[indices[1]], seamY, scale);
+    path.moveTo((first.dx + second.dx) / 2, (first.dy + second.dy) / 2);
+    for (var index = 1; index <= indices.length; index++) {
+      final current = _verticalPoint(
+        points[indices[index % indices.length]],
+        seamY,
+        scale,
+      );
+      final next = _verticalPoint(
+        points[indices[(index + 1) % indices.length]],
+        seamY,
+        scale,
+      );
+      path.quadraticBezierTo(
+        current.dx,
+        current.dy,
+        (current.dx + next.dx) / 2,
+        (current.dy + next.dy) / 2,
+      );
+    }
+    return path..close();
+  }
+
+  static Offset _verticalPoint(Offset point, double seamY, double scale) =>
+      Offset(point.dx, seamY + (point.dy - seamY) * scale);
 
   /// 面部皮肤蒙版：保留脸部轮廓，同时挖掉眼睛和嘴唇，供底妆与像素柔化共用。
   static Path skinPath(List<Offset> points, {double featurePadding = 0}) {
@@ -214,4 +259,9 @@ abstract final class MakeupPainterUtils {
 
   static double angle(Offset a, Offset b) =>
       math.atan2(b.dy - a.dy, b.dx - a.dx);
+
+  static double _smoothStep(double edge0, double edge1, double value) {
+    final t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    return t * t * (3 - 2 * t);
+  }
 }

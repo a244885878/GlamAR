@@ -33,4 +33,22 @@ void main() {
     expect(pressured, greaterThan(healthy));
     expect(pressured, greaterThanOrEqualTo(const Duration(milliseconds: 500)));
   });
+
+  test('degrades only optional render detail under sustained pressure', () {
+    final healthy = ArRuntimeGovernor.renderDetailQuality(
+      faceFps: 28,
+      faceInferenceMs: 25,
+    );
+    final pressured = ArRuntimeGovernor.renderDetailQuality(
+      faceFps: 13,
+      faceInferenceMs: 52,
+    );
+
+    expect(healthy, 1);
+    expect(pressured, 0.4);
+    expect(
+      ArRuntimeGovernor.renderDetailQuality(faceFps: 0, faceInferenceMs: 0),
+      1,
+    );
+  });
 }

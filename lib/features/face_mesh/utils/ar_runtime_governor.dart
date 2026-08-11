@@ -40,4 +40,22 @@ abstract final class ArRuntimeGovernor {
     }
     return Duration(milliseconds: milliseconds.round());
   }
+
+  /// 根据真实跟踪吞吐调整非核心渲染细节。启动期没有 FPS 样本时保持完整
+  /// 质量；压力增大时优先让出 GPU/CPU 给 FaceMesh，而不撤掉主体妆容。
+  static double renderDetailQuality({
+    required double faceFps,
+    required double faceInferenceMs,
+  }) {
+    if (faceFps <= 0) return 1;
+    var quality = switch (faceFps) {
+      >= 26 => 1.0,
+      >= 22 => 0.86,
+      >= 18 => 0.72,
+      >= 14 => 0.58,
+      _ => 0.44,
+    };
+    if (faceInferenceMs > 46) quality -= 0.08;
+    return quality.clamp(0.4, 1).toDouble();
+  }
 }

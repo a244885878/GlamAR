@@ -33,6 +33,7 @@ class EyelinerPainter extends CustomPainter {
       ),
     ]) {
       final opacity = renderContext.detailOpacityForSide(sideA: entry.sideA);
+      final eyeOpenness = renderContext.eyeOpennessForSide(sideA: entry.sideA);
       final localEyeWidth =
           (landmarks[entry.indices.last] - landmarks[entry.indices.first])
               .distance;
@@ -64,9 +65,12 @@ class EyelinerPainter extends CustomPainter {
       );
       canvas.drawPath(path, paint);
 
-      if (config.detail > 0.46) {
+      if (config.detail > 0.46 && renderContext.fineDetailVisibility > 0.5) {
         final lashPaint = Paint()
-          ..color = color.withValues(alpha: config.intensity * opacity * 0.55)
+          ..color = color.withValues(
+            alpha:
+                config.intensity * opacity * (0.38 + eyeOpenness * 0.62) * 0.55,
+          )
           ..strokeWidth = MakeupPainterUtils.scaledSize(
             localEyeWidth,
             0.009,

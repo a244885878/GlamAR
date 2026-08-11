@@ -9,12 +9,13 @@ import 'package:mediapipe_face_mesh/mediapipe_face_mesh.dart';
 /// 旋转和缩放速度做短时预测，让 15~30 FPS 的模型结果仍能贴着 60 FPS 预览。
 class AdaptiveLandmarkSmoother {
   static const _poseAnchors = <int>[1, 10, 33, 152, 234, 263, 454];
-  static const _maxPrediction = Duration(milliseconds: 96);
+  static const defaultMaximumPrediction = Duration(milliseconds: 96);
 
   final List<Offset> _positions = <Offset>[];
   final List<Offset> _velocities = <Offset>[];
+  final Stopwatch _clock = Stopwatch()..start();
 
-  DateTime? _lastSourceTimestamp;
+  Duration? _lastSourceTimestamp;
   Offset _center = Offset.zero;
   Offset _centerVelocity = Offset.zero;
   double _faceScale = 1;
@@ -24,10 +25,13 @@ class AdaptiveLandmarkSmoother {
 
   bool get hasFace => _positions.length >= 468;
 
-  bool needsPredictionAt(DateTime timestamp) {
+  bool needsPredictionAt(
+    Duration timestamp, {
+    Duration maximumPrediction = defaultMaximumPrediction,
+  }) {
     if (!hasFace || _lastSourceTimestamp == null) return false;
-    final elapsed = timestamp.difference(_lastSourceTimestamp!);
-    return !elapsed.isNegative && elapsed <= _maxPrediction;
+    final elapsed = timestamp - _lastSourceTimestamp!;
+    return !elapsed.isNegative && elapsed <= maximumPrediction;
   }
 
   /// 接收一帧模型观测，并返回补偿到当前显示时刻的关键点。
@@ -35,14 +39,17 @@ class AdaptiveLandmarkSmoother {
     required FaceMeshResult mesh,
     required Size targetSize,
     required bool mirrorHorizontal,
-    DateTime? sourceTimestamp,
+    Duration? sourceTimestamp,
+    Duration? displayTimestamp,
+    Duration maximumPrediction = defaultMaximumPrediction,
   }) {
     if (mesh.landmarks.length < 468 || targetSize.isEmpty) {
       reset();
       return null;
     }
 
-    final timestamp = sourceTimestamp ?? DateTime.now();
+    final timestamp = sourceTimestamp ?? _clock.elapsed;
+    final displayTime = displayTimestamp ?? _clock.elapsed;
     final raw = List<Offset>.generate(mesh.landmarks.length, (index) {
       return mesh.landmarkAsOffset(
         mesh.landmarks[index],
@@ -54,10 +61,13 @@ class AdaptiveLandmarkSmoother {
 
     if (_positions.length != raw.length || _lastSourceTimestamp == null) {
       _seed(raw, timestamp);
-      return predict();
+      return predict(
+        displayTimestamp: displayTime,
+        maximumPrediction: maximumPrediction,
+      );
     }
 
-    final elapsed = timestamp.difference(_lastSourceTimestamp!);
+    final elapsed = timestamp - _lastSourceTimestamp!;
     final dt = (elapsed.inMicroseconds / Duration.microsecondsPerSecond).clamp(
       1 / 120,
       0.12,
@@ -148,17 +158,23 @@ class AdaptiveLandmarkSmoother {
       poseAlpha * 0.72,
     );
     _lastSourceTimestamp = timestamp;
-    return predict();
+    return predict(
+      displayTimestamp: displayTime,
+      maximumPrediction: maximumPrediction,
+    );
   }
 
   /// 生成显示时刻的预测结果。预测窗口很短，超过上限会自动钳制以免过冲。
-  List<Offset>? predict({DateTime? displayTimestamp}) {
+  List<Offset>? predict({
+    Duration? displayTimestamp,
+    Duration maximumPrediction = defaultMaximumPrediction,
+  }) {
     if (!hasFace || _lastSourceTimestamp == null) return null;
-    final now = displayTimestamp ?? DateTime.now();
-    final elapsed = now.difference(_lastSourceTimestamp!);
+    final now = displayTimestamp ?? _clock.elapsed;
+    final elapsed = now - _lastSourceTimestamp!;
     final micros = elapsed.inMicroseconds.clamp(
       0,
-      _maxPrediction.inMicroseconds,
+      maximumPrediction.inMicroseconds,
     );
     final horizon = micros / Duration.microsecondsPerSecond;
     if (horizon == 0) return List<Offset>.unmodifiable(_positions);
@@ -217,7 +233,7 @@ class AdaptiveLandmarkSmoother {
     _angularVelocity = 0;
   }
 
-  void _seed(List<Offset> raw, DateTime timestamp) {
+  void _seed(List<Offset> raw, Duration timestamp) {
     _positions
       ..clear()
       ..addAll(raw);

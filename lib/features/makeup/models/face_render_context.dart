@@ -39,6 +39,9 @@ class FaceRenderContext {
     this.sideBVisibility = 1,
     this.profileOpacity = 1,
     this.fineDetailVisibility = 1,
+    this.sideAEyeOpenness = 1,
+    this.sideBEyeOpenness = 1,
+    this.mouthOpenness = 0,
   });
 
   const FaceRenderContext.neutral()
@@ -46,12 +49,16 @@ class FaceRenderContext {
       sideAVisibility = 1,
       sideBVisibility = 1,
       profileOpacity = 1,
-      fineDetailVisibility = 1;
+      fineDetailVisibility = 1,
+      sideAEyeOpenness = 1,
+      sideBEyeOpenness = 1,
+      mouthOpenness = 0;
 
   factory FaceRenderContext.fromMesh(
     FaceMeshResult mesh,
-    FaceLighting lighting,
-  ) {
+    FaceLighting lighting, {
+    double runtimeDetailQuality = 1,
+  }) {
     if (mesh.landmarks.length < 468) {
       return FaceRenderContext(lighting: lighting);
     }
@@ -72,7 +79,38 @@ class FaceRenderContext {
       profileOpacity: 0.76 + math.sqrt(profileVisibility) * 0.24,
       // 小脸在预览中的有效像素更少，保留主体色彩并收敛睫毛、珠光等
       // 高频细节，减少远距离锯齿和闪烁。
-      fineDetailVisibility: 0.42 + _smoothStep(0.11, 0.28, faceSpan) * 0.58,
+      fineDetailVisibility:
+          ((0.42 + _smoothStep(0.11, 0.28, faceSpan) * 0.58) *
+                  runtimeDetailQuality.clamp(0.4, 1))
+              .clamp(0.24, 1)
+              .toDouble(),
+      sideAEyeOpenness: _normalizedFeatureOpening(
+        points,
+        nearA: 159,
+        nearB: 145,
+        widthA: 33,
+        widthB: 133,
+        closedRatio: 0.045,
+        openRatio: 0.24,
+      ),
+      sideBEyeOpenness: _normalizedFeatureOpening(
+        points,
+        nearA: 386,
+        nearB: 374,
+        widthA: 362,
+        widthB: 263,
+        closedRatio: 0.045,
+        openRatio: 0.24,
+      ),
+      mouthOpenness: _normalizedFeatureOpening(
+        points,
+        nearA: 13,
+        nearB: 14,
+        widthA: 61,
+        widthB: 291,
+        closedRatio: 0.018,
+        openRatio: 0.2,
+      ),
     );
   }
 
@@ -100,6 +138,22 @@ class FaceRenderContext {
         current.fineDetailVisibility,
         t,
       ),
+      // 表情比头部姿态更快跟随；恢复稍慢，避免临界状态闪烁。
+      sideAEyeOpenness: _lerp(
+        previous.sideAEyeOpenness,
+        current.sideAEyeOpenness,
+        current.sideAEyeOpenness < previous.sideAEyeOpenness ? 0.76 : 0.54,
+      ),
+      sideBEyeOpenness: _lerp(
+        previous.sideBEyeOpenness,
+        current.sideBEyeOpenness,
+        current.sideBEyeOpenness < previous.sideBEyeOpenness ? 0.76 : 0.54,
+      ),
+      mouthOpenness: _lerp(
+        previous.mouthOpenness,
+        current.mouthOpenness,
+        current.mouthOpenness > previous.mouthOpenness ? 0.68 : 0.56,
+      ),
     );
   }
 
@@ -110,6 +164,12 @@ class FaceRenderContext {
   final double sideBVisibility;
   final double profileOpacity;
   final double fineDetailVisibility;
+  final double sideAEyeOpenness;
+  final double sideBEyeOpenness;
+  final double mouthOpenness;
+
+  double eyeOpennessForSide({required bool sideA}) =>
+      sideA ? sideAEyeOpenness : sideBEyeOpenness;
 
   double opacityForSide({required bool sideA}) {
     final sideExposure = sideA
@@ -145,6 +205,20 @@ class FaceRenderContext {
 
   static double _perspectiveVisibility(double ratio) =>
       0.12 + _smoothStep(0.06, 0.92, ratio) * 0.88;
+
+  static double _normalizedFeatureOpening(
+    List<FaceMeshLandmark> points, {
+    required int nearA,
+    required int nearB,
+    required int widthA,
+    required int widthB,
+    required double closedRatio,
+    required double openRatio,
+  }) {
+    final width = math.max(0.0001, _distance(points[widthA], points[widthB]));
+    final ratio = _distance(points[nearA], points[nearB]) / width;
+    return _smoothStep(closedRatio, openRatio, ratio);
+  }
 
   static double _smoothStep(double edge0, double edge1, double value) {
     final t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);

@@ -4,6 +4,7 @@ uniform vec2 u_size;
 uniform float u_strength;
 uniform vec3 u_tone;
 uniform float u_tone_amount;
+uniform float u_texture_retention;
 uniform sampler2D u_texture;
 
 out vec4 frag_color;
@@ -63,8 +64,16 @@ void main() {
   total_weight += weight;
 
   vec3 edge_aware = accumulated / total_weight;
-  // 大部分高频皮肤纹理被加回，避免传统高斯磨皮的塑料感。
-  vec3 refined = edge_aware + (center - edge_aware) * 0.72;
+  // 复用已有 9 次采样做频率分离，不增加纹理读取。低能量色斑适度
+  // 均匀化，毛孔、细纹和五官边缘等高能量细节则更完整地回填。
+  vec3 high_frequency = center - edge_aware;
+  float detail_energy = dot(abs(high_frequency), vec3(0.3333));
+  float adaptive_retention = mix(
+    clamp(u_texture_retention, 0.56, 0.88),
+    0.94,
+    smoothstep(0.012, 0.07, detail_energy)
+  );
+  vec3 refined = edge_aware + high_frequency * adaptive_retention;
   vec3 result = mix(center, refined, clamp(u_strength, 0.0, 0.34));
 
   float luminance = dot(result, vec3(0.2126, 0.7152, 0.0722));

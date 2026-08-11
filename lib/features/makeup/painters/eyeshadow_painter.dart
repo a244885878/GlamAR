@@ -45,9 +45,13 @@ class EyeshadowPainter extends CustomPainter {
       final detailOpacity = renderContext.detailOpacityForSide(
         sideA: eye.sideA,
       );
+      final eyeOpenness = renderContext.eyeOpennessForSide(sideA: eye.sideA);
       final eyeWidth =
           (landmarks[indices.last] - landmarks[indices.first]).distance;
-      final lift = eyeWidth * (0.2 + config.detail * 0.14);
+      // 闭眼时上眼睑关键点会向下移动；同步收敛上扬距离，让眼影面积
+      // 平滑变化，避免眨眼瞬间向眉毛方向“呼吸”。
+      final blinkStability = 0.62 + eyeOpenness * 0.38;
+      final lift = eyeWidth * (0.2 + config.detail * 0.14) * blinkStability;
       final path = _lidPath(indices, lift);
       final bounds = path.getBounds();
       canvas.drawPath(
@@ -110,7 +114,7 @@ class EyeshadowPainter extends CustomPainter {
           ),
       );
 
-      if (config.detail > 0.62) {
+      if (config.detail > 0.62 && renderContext.fineDetailVisibility > 0.5) {
         final shimmerCenter = Offset(
           bounds.center.dx,
           bounds.top + bounds.height * 0.52,
@@ -137,6 +141,7 @@ class EyeshadowPainter extends CustomPainter {
                           config.intensity *
                           detailOpacity *
                           renderContext.highlightOpacity *
+                          (0.68 + eyeOpenness * 0.32) *
                           0.22,
                     ),
                 Colors.transparent,

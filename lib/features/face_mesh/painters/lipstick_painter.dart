@@ -26,6 +26,7 @@ class LipstickPainter extends CustomPainter {
     final lipWidth = bounds.width > 1 ? bounds.width : 1.0;
     final color = renderContext.adaptColor(config.color);
     final opacity = renderContext.centralOpacity;
+    final glossStability = 1 - renderContext.mouthOpenness * 0.34;
     final upperColor = Color.lerp(color, Colors.black, 0.13)!;
     final lowerColor = Color.lerp(color, Colors.white, 0.055)!;
 
@@ -105,6 +106,7 @@ class LipstickPainter extends CustomPainter {
                     config.intensity *
                     opacity *
                     renderContext.highlightOpacity *
+                    glossStability *
                     (finish == LipFinish.glass ? 0.2 : 0.075),
               ),
               Colors.transparent,

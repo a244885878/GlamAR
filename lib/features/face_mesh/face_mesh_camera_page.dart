@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
 import 'package:glamar/app/theme/glamar_theme.dart';
 import 'package:glamar/features/face_mesh/utils/adaptive_landmark_smoother.dart';
+import 'package:glamar/features/face_mesh/utils/ar_frame_timeline.dart';
 import 'package:glamar/features/face_mesh/utils/ar_runtime_governor.dart';
 import 'package:glamar/features/face_mesh/utils/face_occlusion_inference_worker.dart';
 import 'package:glamar/features/face_mesh/utils/face_mesh_inference_worker.dart';
@@ -62,6 +63,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   final ValueNotifier<_OcclusionTexture?> _occlusionTexture =
       ValueNotifier<_OcclusionTexture?>(null);
   final AdaptiveLandmarkSmoother _landmarkSmoother = AdaptiveLandmarkSmoother();
+  final ArFrameTimeline _frameTimeline = ArFrameTimeline();
   late final Ticker _renderTicker;
   late MakeupLook _activeLook;
   late MakeupLook _presetLook;
@@ -71,15 +73,17 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   bool _isCapturing = false;
   bool _showCaptureFlash = false;
 
-  DateTime? _lastMeshFrameTimestamp;
-  DateTime? _lastValidMeshTimestamp;
-  DateTime? _performanceWindowStartedAt;
+  Duration? _lastMeshFrameTimestamp;
+  Duration? _lastValidMeshTimestamp;
+  Duration? _performanceWindowStartedAt;
   int _performanceFrameCount = 0;
   double _inferenceMsEma = 0;
   int _consecutiveInferenceErrors = 0;
   int _consecutiveOcclusionErrors = 0;
   double _occlusionInferenceMsEma = 0;
   double _makeupTrackingOpacity = 1;
+  double _runtimeRenderQuality = 1;
+  bool _gpuSkinFilterEnabled = true;
   DateTime _nextOcclusionAllowedAt = DateTime.fromMillisecondsSinceEpoch(0);
   FaceLighting _faceLighting = FaceLighting.neutral;
   FaceRenderContext _renderContext = const FaceRenderContext.neutral();
@@ -214,7 +218,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   void _onInferenceResult(
     FaceMeshResult? mesh, {
     required FaceLighting lighting,
-    required DateTime sourceTimestamp,
+    required Duration sourceTimestamp,
     required Duration inferenceDuration,
   }) {
     _consecutiveInferenceErrors = 0;
@@ -228,7 +232,11 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     if (mesh != null) {
       _lastValidMeshTimestamp = sourceTimestamp;
       _makeupTrackingOpacity = 1;
-      final observedContext = FaceRenderContext.fromMesh(mesh, _faceLighting);
+      final observedContext = FaceRenderContext.fromMesh(
+        mesh,
+        _faceLighting,
+        runtimeDetailQuality: _runtimeRenderQuality,
+      );
       _renderContext = hadRecentGeometry
           ? FaceRenderContext.stabilizeGeometry(
               _renderContext,
@@ -248,7 +256,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
 
   void _updateTrackedLandmarks(
     FaceMeshResult? mesh, {
-    DateTime? sourceTimestamp,
+    Duration? sourceTimestamp,
   }) {
     if (_paintSize == Size.zero) {
       _landmarkSmoother.reset();
@@ -256,7 +264,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       return;
     }
     if (mesh == null) {
-      _updateTrackingBridge(DateTime.now());
+      _updateTrackingBridge(_frameTimeline.now);
       return;
     }
 
@@ -264,38 +272,51 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       mesh: mesh,
       targetSize: _paintSize,
       mirrorHorizontal: _mirrorHorizontal,
-      sourceTimestamp: sourceTimestamp ?? _lastMeshFrameTimestamp,
+      sourceTimestamp:
+          sourceTimestamp ?? _lastMeshFrameTimestamp ?? _frameTimeline.now,
+      displayTimestamp: _frameTimeline.renderTimestamp,
+      maximumPrediction: _frameTimeline.maximumPredictionHorizon,
     );
     _makeupLandmarks.value = pixels;
   }
 
   void _onRenderTick(Duration _) {
-    final now = DateTime.now();
+    final now = _frameTimeline.now;
+    final renderTimestamp = _frameTimeline.renderTimestamp;
     if (!_makeupVisible) return;
     if (_meshResult == null) {
       _updateTrackingBridge(now);
       return;
     }
-    if (!_landmarkSmoother.needsPredictionAt(now)) return;
-    final predicted = _landmarkSmoother.predict(displayTimestamp: now);
+    if (!_landmarkSmoother.needsPredictionAt(
+      renderTimestamp,
+      maximumPrediction: _frameTimeline.maximumPredictionHorizon,
+    )) {
+      return;
+    }
+    final predicted = _landmarkSmoother.predict(
+      displayTimestamp: renderTimestamp,
+      maximumPrediction: _frameTimeline.maximumPredictionHorizon,
+    );
     if (predicted != null) _makeupLandmarks.value = predicted;
   }
 
-  void _updateTrackingBridge(DateTime now) {
+  void _updateTrackingBridge(Duration now) {
     final lastValid = _lastValidMeshTimestamp;
     if (lastValid == null || !_landmarkSmoother.hasFace) {
       _expireTrackingBridge();
       return;
     }
-    final opacity = ArRuntimeGovernor.trackingOpacity(
-      now.difference(lastValid),
-    );
+    final opacity = ArRuntimeGovernor.trackingOpacity(now - lastValid);
     if (opacity <= 0) {
       _expireTrackingBridge();
       return;
     }
     _makeupTrackingOpacity = opacity;
-    final predicted = _landmarkSmoother.predict(displayTimestamp: now);
+    final predicted = _landmarkSmoother.predict(
+      displayTimestamp: _frameTimeline.renderTimestamp,
+      maximumPrediction: _frameTimeline.maximumPredictionHorizon,
+    );
     if (predicted != null) _makeupLandmarks.value = predicted;
   }
 
@@ -311,7 +332,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   }
 
   void _recordPerformance(Duration duration, bool trackedFace) {
-    final now = DateTime.now();
+    final now = _frameTimeline.now;
     _performanceWindowStartedAt ??= now;
     _performanceFrameCount++;
     final currentMs = duration.inMicroseconds / 1000;
@@ -319,7 +340,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
         ? currentMs
         : _inferenceMsEma * 0.82 + currentMs * 0.18;
 
-    final window = now.difference(_performanceWindowStartedAt!);
+    final window = now - _performanceWindowStartedAt!;
     if (window < const Duration(milliseconds: 600)) return;
     final fps =
         _performanceFrameCount /
@@ -327,10 +348,27 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     _trackingPerformance.value = _TrackingPerformance(
       fps: fps,
       inferenceMs: _inferenceMsEma,
+      pipelineLatencyMs: _frameTimeline.pipelineLatencyMs,
       tracking: trackedFace,
     );
+    _updateRuntimeRenderQuality(fps, _inferenceMsEma);
     _performanceWindowStartedAt = now;
     _performanceFrameCount = 0;
+  }
+
+  void _updateRuntimeRenderQuality(double fps, double inferenceMs) {
+    final target = ArRuntimeGovernor.renderDetailQuality(
+      faceFps: fps,
+      faceInferenceMs: inferenceMs,
+    );
+    final response = target < _runtimeRenderQuality ? 0.55 : 0.16;
+    _runtimeRenderQuality += (target - _runtimeRenderQuality) * response;
+    // 使用不同的关闭/恢复阈值，避免 FPS 在边界附近时反复创建滤镜层。
+    if (_gpuSkinFilterEnabled && _runtimeRenderQuality < 0.5) {
+      _gpuSkinFilterEnabled = false;
+    } else if (!_gpuSkinFilterEnabled && _runtimeRenderQuality > 0.74) {
+      _gpuSkinFilterEnabled = true;
+    }
   }
 
   void _onInferenceError(Object error) {
@@ -348,7 +386,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     // 永远只保留最新相机帧，推理来不及时直接丢弃旧帧，避免延迟不断累积。
     _pendingCameraFrame = _PendingCameraFrame(
       image: image,
-      receivedAt: DateTime.now(),
+      stamp: _frameTimeline.markCameraFrame(),
     );
     unawaited(_processLatestFrame());
 
@@ -394,10 +432,11 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
         isAndroid: Platform.isAndroid,
       );
       stopwatch.stop();
+      _frameTimeline.markInferenceCompleted(pending.stamp);
       _onInferenceResult(
         sample.mesh,
         lighting: sample.lighting,
-        sourceTimestamp: pending.receivedAt,
+        sourceTimestamp: pending.stamp.capturedAt,
         inferenceDuration: stopwatch.elapsed,
       );
     } catch (error) {
@@ -559,6 +598,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     _consecutiveOcclusionErrors = 0;
     _occlusionInferenceMsEma = 0;
     _makeupTrackingOpacity = 1;
+    _runtimeRenderQuality = 1;
+    _gpuSkinFilterEnabled = true;
     _faceLighting = FaceLighting.neutral;
     _renderContext = const FaceRenderContext.neutral();
   }
@@ -584,6 +625,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       _landmarkCount = 0;
       _lastValidMeshTimestamp = null;
       _makeupTrackingOpacity = 0;
+      _frameTimeline.reset();
       _landmarkSmoother.reset();
       _makeupLandmarks.value = null;
     } else if (state == AppLifecycleState.resumed &&
@@ -800,7 +842,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                 ..setFloat(
                   6,
                   config.intensity * photoRenderContext.centralOpacity * 0.055,
-                );
+                )
+                ..setFloat(7, 0.66 + config.detail * 0.18);
               skinPaint.imageFilter = ui.ImageFilter.shader(shader);
               photoShaders.add(shader);
             } catch (_) {
@@ -1026,7 +1069,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                                     final makeup = Stack(
                                       fit: StackFit.expand,
                                       children: [
-                                        if (_activeLook.complexion.enabled)
+                                        if (_activeLook.complexion.enabled &&
+                                            _gpuSkinFilterEnabled)
                                           _SkinSmoothingLayer(
                                             landmarks: pixels,
                                             config: _activeLook.complexion,
@@ -1214,7 +1258,7 @@ class _PerformanceBadge extends StatelessWidget {
               const SizedBox(width: 6),
               Text(
                 ready
-                    ? 'AR ${performance.fps.round()} FPS  ·  ${performance.inferenceMs.round()} ms'
+                    ? 'AR ${performance.fps.round()} FPS  ·  E2E ${performance.pipelineLatencyMs.round()} ms'
                     : 'AR -- FPS',
                 style: TextStyle(
                   color: Colors.white.withValues(alpha: 0.82),
@@ -1479,7 +1523,8 @@ class _SkinSmoothingLayerState extends State<_SkinSmoothingLayer> {
       ..setFloat(3, color.r)
       ..setFloat(4, color.g)
       ..setFloat(5, color.b)
-      ..setFloat(6, config.intensity * opacity * 0.055);
+      ..setFloat(6, config.intensity * opacity * 0.055)
+      ..setFloat(7, 0.66 + config.detail * 0.18);
   }
 
   @override
@@ -1738,10 +1783,10 @@ class _ErrorView extends StatelessWidget {
 }
 
 class _PendingCameraFrame {
-  const _PendingCameraFrame({required this.image, required this.receivedAt});
+  const _PendingCameraFrame({required this.image, required this.stamp});
 
   final CameraImage image;
-  final DateTime receivedAt;
+  final ArFrameStamp stamp;
 }
 
 class _PendingOcclusionFrame {
@@ -1762,10 +1807,12 @@ class _TrackingPerformance {
   const _TrackingPerformance({
     this.fps = 0,
     this.inferenceMs = 0,
+    this.pipelineLatencyMs = 0,
     this.tracking = false,
   });
 
   final double fps;
   final double inferenceMs;
+  final double pipelineLatencyMs;
   final bool tracking;
 }

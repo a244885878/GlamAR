@@ -56,26 +56,28 @@ class BrowPainter extends CustomPainter {
           ),
       );
 
-      final hairPaint = Paint()
-        ..color = color.withValues(
-          alpha: config.intensity * detailOpacity * 0.4,
-        )
-        ..strokeWidth = MakeupPainterUtils.scaledSize(
-          browSpan,
-          0.01,
-          minimum: 0.32,
-          maximum: width * 0.004,
-        )
-        ..strokeCap = StrokeCap.round
-        ..blendMode = BlendMode.multiply;
-      for (var i = 0; i < indices.length; i++) {
-        final p = landmarks[indices[i]];
-        final verticalFactor = i < 2 ? -0.1 : -0.067;
-        canvas.drawLine(
-          p,
-          Offset(p.dx + browSpan * 0.033, p.dy + browSpan * verticalFactor),
-          hairPaint,
-        );
+      if (renderContext.fineDetailVisibility > 0.5) {
+        final hairPaint = Paint()
+          ..color = color.withValues(
+            alpha: config.intensity * detailOpacity * 0.4,
+          )
+          ..strokeWidth = MakeupPainterUtils.scaledSize(
+            browSpan,
+            0.01,
+            minimum: 0.32,
+            maximum: width * 0.004,
+          )
+          ..strokeCap = StrokeCap.round
+          ..blendMode = BlendMode.multiply;
+        for (var i = 0; i < indices.length; i++) {
+          final p = landmarks[indices[i]];
+          final verticalFactor = i < 2 ? -0.1 : -0.067;
+          canvas.drawLine(
+            p,
+            Offset(p.dx + browSpan * 0.033, p.dy + browSpan * verticalFactor),
+            hairPaint,
+          );
+        }
       }
     }
   }

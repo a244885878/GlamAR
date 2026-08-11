@@ -10,13 +10,13 @@ void main() {
 
   test('keeps still landmarks stable', () {
     final smoother = AdaptiveLandmarkSmoother();
-    final now = DateTime.now();
+    const now = Duration(seconds: 10);
     final mesh = _mesh(shiftX: 0);
     final first = smoother.observe(
       mesh: mesh,
       targetSize: targetSize,
       mirrorHorizontal: false,
-      sourceTimestamp: now.subtract(const Duration(milliseconds: 32)),
+      sourceTimestamp: now - const Duration(milliseconds: 32),
     )!;
     final second = smoother.observe(
       mesh: mesh,
@@ -30,12 +30,12 @@ void main() {
 
   test('predicts moving face forward between inference frames', () {
     final smoother = AdaptiveLandmarkSmoother();
-    final now = DateTime.now();
+    const now = Duration(seconds: 10);
     smoother.observe(
       mesh: _mesh(shiftX: 0),
       targetSize: targetSize,
       mirrorHorizontal: false,
-      sourceTimestamp: now.subtract(const Duration(milliseconds: 33)),
+      sourceTimestamp: now - const Duration(milliseconds: 33),
     );
     final observed = smoother.observe(
       mesh: _mesh(shiftX: 0.018),
@@ -44,7 +44,7 @@ void main() {
       sourceTimestamp: now,
     )!;
     final predicted = smoother.predict(
-      displayTimestamp: now.add(const Duration(milliseconds: 33)),
+      displayTimestamp: now + const Duration(milliseconds: 33),
     )!;
 
     expect(predicted[1].dx, greaterThan(observed[1].dx));
@@ -52,12 +52,12 @@ void main() {
 
   test('clamps prediction during a longer tracking dropout', () {
     final smoother = AdaptiveLandmarkSmoother();
-    final now = DateTime.now();
+    const now = Duration(seconds: 10);
     smoother.observe(
       mesh: _mesh(shiftX: 0),
       targetSize: targetSize,
       mirrorHorizontal: false,
-      sourceTimestamp: now.subtract(const Duration(milliseconds: 33)),
+      sourceTimestamp: now - const Duration(milliseconds: 33),
     );
     smoother.observe(
       mesh: _mesh(shiftX: 0.018),
@@ -67,10 +67,10 @@ void main() {
     );
 
     final clamped = smoother.predict(
-      displayTimestamp: now.add(const Duration(milliseconds: 96)),
+      displayTimestamp: now + const Duration(milliseconds: 96),
     )!;
     final muchLater = smoother.predict(
-      displayTimestamp: now.add(const Duration(milliseconds: 400)),
+      displayTimestamp: now + const Duration(milliseconds: 400),
     )!;
 
     expect((clamped[1] - muchLater[1]).distance, lessThan(0.001));
@@ -78,12 +78,12 @@ void main() {
 
   test('predicts an approaching face without distorting proportions', () {
     final smoother = AdaptiveLandmarkSmoother();
-    final now = DateTime.now();
+    const now = Duration(seconds: 10);
     smoother.observe(
       mesh: _mesh(shiftX: 0, scale: 1),
       targetSize: targetSize,
       mirrorHorizontal: false,
-      sourceTimestamp: now.subtract(const Duration(milliseconds: 33)),
+      sourceTimestamp: now - const Duration(milliseconds: 33),
     );
     final observed = smoother.observe(
       mesh: _mesh(shiftX: 0, scale: 1.12),
@@ -92,7 +92,7 @@ void main() {
       sourceTimestamp: now,
     )!;
     final predicted = smoother.predict(
-      displayTimestamp: now.add(const Duration(milliseconds: 33)),
+      displayTimestamp: now + const Duration(milliseconds: 33),
     )!;
 
     final observedFaceWidth = (observed[454] - observed[234]).distance;
@@ -107,12 +107,12 @@ void main() {
 
   test('limits a single landmark spike without freezing the face', () {
     final smoother = AdaptiveLandmarkSmoother();
-    final now = DateTime.now();
+    const now = Duration(seconds: 10);
     final first = smoother.observe(
       mesh: _mesh(shiftX: 0),
       targetSize: targetSize,
       mirrorHorizontal: false,
-      sourceTimestamp: now.subtract(const Duration(milliseconds: 33)),
+      sourceTimestamp: now - const Duration(milliseconds: 33),
     )!;
     final observed = smoother.observe(
       mesh: _mesh(shiftX: 0, outlierIndex: 50, outlierDx: 0.2),
@@ -128,12 +128,12 @@ void main() {
 
   test('follows a fast rigid rotation without stretching the face', () {
     final smoother = AdaptiveLandmarkSmoother();
-    final now = DateTime.now();
+    const now = Duration(seconds: 10);
     final first = smoother.observe(
       mesh: _mesh(shiftX: 0),
       targetSize: targetSize,
       mirrorHorizontal: false,
-      sourceTimestamp: now.subtract(const Duration(milliseconds: 33)),
+      sourceTimestamp: now - const Duration(milliseconds: 33),
     )!;
     final observed = smoother.observe(
       mesh: _mesh(shiftX: 0, rotation: 0.16),

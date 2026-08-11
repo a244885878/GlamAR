@@ -16,6 +16,21 @@ void main() {
     expect(lipPath.contains(const Offset(238, 220)), isTrue);
   });
 
+  test('closed lips do not create an unstable inner cutout', () {
+    final points = List<Offset>.filled(468, const Offset(200, 220));
+    _placeEllipse(points, LipLandmarkIndices.outerLip, 200, 220, 56, 25);
+    for (var index = 0; index < LipLandmarkIndices.innerLip.length; index++) {
+      final t = index / (LipLandmarkIndices.innerLip.length - 1);
+      points[LipLandmarkIndices.innerLip[index]] = Offset(176 + t * 48, 220);
+    }
+    points[13] = const Offset(200, 220);
+    points[14] = const Offset(200, 220);
+
+    final lipPath = MakeupPainterUtils.lipPath(points);
+
+    expect(lipPath.contains(const Offset(200, 220)), isTrue);
+  });
+
   test('skin mask protects eyes, brows and lips', () {
     final points = List<Offset>.filled(468, const Offset(200, 220));
     _placeEllipse(points, MakeupPainterUtils.faceOval, 200, 220, 150, 190);

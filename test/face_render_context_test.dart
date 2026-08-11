@@ -76,6 +76,18 @@ void main() {
     expect(far.centralOpacity, closeTo(near.centralOpacity, 0.001));
   });
 
+  test('runtime pressure reduces fine detail but preserves core opacity', () {
+    final full = FaceRenderContext.fromMesh(_mesh(), FaceLighting.neutral);
+    final reduced = FaceRenderContext.fromMesh(
+      _mesh(),
+      FaceLighting.neutral,
+      runtimeDetailQuality: 0.4,
+    );
+
+    expect(reduced.fineDetailVisibility, lessThan(full.fineDetailVisibility));
+    expect(reduced.centralOpacity, closeTo(full.centralOpacity, 0.001));
+  });
+
   test('stabilizes geometry weights without adding light lag', () {
     const previous = FaceRenderContext(
       lighting: FaceLighting(exposure: 0.2),
@@ -95,6 +107,38 @@ void main() {
     expect(stabilized.lighting.exposure, 0.8);
   });
 
+  test('detects blink and mouth opening from existing landmarks', () {
+    final expression = FaceRenderContext.fromMesh(
+      _expressionMesh(sideAEyeGap: 0.004, sideBEyeGap: 0.03, mouthGap: 0.05),
+      FaceLighting.neutral,
+    );
+
+    expect(expression.sideAEyeOpenness, lessThan(0.1));
+    expect(expression.sideBEyeOpenness, greaterThan(0.8));
+    expect(expression.mouthOpenness, greaterThan(0.8));
+  });
+
+  test('expression smoothing reacts quickly without snapping', () {
+    const previous = FaceRenderContext(
+      sideAEyeOpenness: 1,
+      sideBEyeOpenness: 1,
+      mouthOpenness: 0,
+    );
+    const current = FaceRenderContext(
+      sideAEyeOpenness: 0,
+      sideBEyeOpenness: 0,
+      mouthOpenness: 1,
+    );
+    final stabilized = FaceRenderContext.stabilizeGeometry(
+      previous,
+      current,
+      0.42,
+    );
+
+    expect(stabilized.sideAEyeOpenness, closeTo(0.24, 0.001));
+    expect(stabilized.mouthOpenness, closeTo(0.68, 0.001));
+  });
+
   test('warmth adaptation stays subtle', () {
     const source = Color(0xFFB73255);
     const context = FaceRenderContext(lighting: FaceLighting(warmth: 1));
@@ -105,6 +149,28 @@ void main() {
     expect((adapted.g - source.g).abs(), lessThan(0.08));
     expect((adapted.b - source.b).abs(), lessThan(0.08));
   });
+}
+
+FaceMeshResult _expressionMesh({
+  required double sideAEyeGap,
+  required double sideBEyeGap,
+  required double mouthGap,
+}) {
+  final mesh = _mesh();
+  final landmarks = mesh.landmarks;
+  landmarks[33] = FaceMeshLandmark(x: 0.36, y: 0.4, z: 0);
+  landmarks[133] = FaceMeshLandmark(x: 0.46, y: 0.4, z: 0);
+  landmarks[159] = FaceMeshLandmark(x: 0.41, y: 0.4 - sideAEyeGap * 0.5, z: 0);
+  landmarks[145] = FaceMeshLandmark(x: 0.41, y: 0.4 + sideAEyeGap * 0.5, z: 0);
+  landmarks[362] = FaceMeshLandmark(x: 0.54, y: 0.4, z: 0);
+  landmarks[263] = FaceMeshLandmark(x: 0.64, y: 0.4, z: 0);
+  landmarks[386] = FaceMeshLandmark(x: 0.59, y: 0.4 - sideBEyeGap * 0.5, z: 0);
+  landmarks[374] = FaceMeshLandmark(x: 0.59, y: 0.4 + sideBEyeGap * 0.5, z: 0);
+  landmarks[61] = FaceMeshLandmark(x: 0.42, y: 0.64, z: 0);
+  landmarks[291] = FaceMeshLandmark(x: 0.58, y: 0.64, z: 0);
+  landmarks[13] = FaceMeshLandmark(x: 0.5, y: 0.64 - mouthGap * 0.5, z: 0);
+  landmarks[14] = FaceMeshLandmark(x: 0.5, y: 0.64 + mouthGap * 0.5, z: 0);
+  return mesh;
 }
 
 FaceMeshResult _mesh({
