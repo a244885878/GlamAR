@@ -1,6 +1,8 @@
 import 'dart:math' as math;
 import 'dart:ui';
 
+import 'package:glamar/features/face_mesh/utils/lip_landmark_indices.dart';
+
 abstract final class MakeupPainterUtils {
   static const faceOval = <int>[
     10,
@@ -53,6 +55,42 @@ abstract final class MakeupPainterUtils {
     466,
     263,
   ];
+  static const leftEyeContour = <int>[
+    33,
+    7,
+    163,
+    144,
+    145,
+    153,
+    154,
+    155,
+    133,
+    173,
+    157,
+    158,
+    159,
+    160,
+    161,
+    246,
+  ];
+  static const rightEyeContour = <int>[
+    362,
+    382,
+    381,
+    380,
+    374,
+    373,
+    390,
+    249,
+    263,
+    466,
+    388,
+    387,
+    386,
+    385,
+    384,
+    398,
+  ];
   static const leftBrow = <int>[70, 63, 105, 66, 107];
   static const rightBrow = <int>[336, 296, 334, 293, 300];
 
@@ -68,6 +106,21 @@ abstract final class MakeupPainterUtils {
       path.lineTo(points[index].dx, points[index].dy);
     }
     return path..close();
+  }
+
+  /// 面部皮肤蒙版：保留脸部轮廓，同时挖掉眼睛和嘴唇，供底妆与像素柔化共用。
+  static Path skinPath(List<Offset> points, {double featurePadding = 0}) {
+    final face = closedPath(points, faceOval);
+    final protectedFeatures = Path();
+    for (final eyeIndices in <List<int>>[leftEyeContour, rightEyeContour]) {
+      final eye = closedPath(points, eyeIndices);
+      protectedFeatures.addOval(eye.getBounds().inflate(featurePadding));
+    }
+    protectedFeatures.addPath(
+      closedPath(points, LipLandmarkIndices.outerLip),
+      Offset.zero,
+    );
+    return Path.combine(PathOperation.difference, face, protectedFeatures);
   }
 
   static Path smoothOpenPath(List<Offset> points, List<int> indices) {

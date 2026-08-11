@@ -4,15 +4,16 @@ import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
 import 'package:glamar/app/theme/glamar_theme.dart';
-import 'package:glamar/features/face_mesh/utils/face_mesh_camera_image_adapter.dart';
 import 'package:glamar/features/face_mesh/utils/adaptive_landmark_smoother.dart';
+import 'package:glamar/features/face_mesh/utils/face_mesh_inference_worker.dart';
 import 'package:glamar/features/makeup/models/makeup_look.dart';
 import 'package:glamar/features/makeup/painters/makeup_renderer.dart';
+import 'package:glamar/features/makeup/painters/makeup_painter_utils.dart';
 import 'package:glamar/features/makeup/widgets/makeup_control_dock.dart';
-import 'package:mediapipe_face_mesh/face_mesh_painter.dart';
 import 'package:mediapipe_face_mesh/mediapipe_face_mesh.dart';
 
 class FaceMeshCameraPage extends StatefulWidget {
@@ -25,7 +26,7 @@ class FaceMeshCameraPage extends StatefulWidget {
 }
 
 class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   static const Map<DeviceOrientation, int> _orientationDegrees = {
     DeviceOrientation.portraitUp: 0,
     DeviceOrientation.landscapeLeft: 90,
@@ -34,14 +35,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   };
 
   CameraController? _cameraController;
-  FaceDetectorProcessor? _detector;
-  FaceMeshProcessor? _meshProcessor;
-  FaceMeshInferenceStreamProcessor? _streamProcessor;
-
-  StreamController<FaceMeshNv21Image>? _nv21Controller;
-  StreamController<FaceMeshImage>? _bgraController;
-  StreamSubscription<FaceMeshInferenceResult>? _inferenceSubscription;
-  int? _streamRotation;
+  FaceMeshInferenceWorker? _inferenceWorker;
 
   FaceMeshResult? _meshResult;
   int _landmarkCount = 0;
@@ -49,14 +43,16 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   bool _isInitializing = true;
   bool _isModelReady = false;
   bool _inferBusy = false;
-  CameraImage? _pendingCameraImage;
-  bool _showSkeleton = false;
+  _PendingCameraFrame? _pendingCameraFrame;
   String _statusMessage = '正在启动相机...';
   Size _paintSize = Size.zero;
 
   final ValueNotifier<List<Offset>?> _makeupLandmarks =
       ValueNotifier<List<Offset>?>(null);
+  final ValueNotifier<_TrackingPerformance> _trackingPerformance =
+      ValueNotifier<_TrackingPerformance>(const _TrackingPerformance());
   final AdaptiveLandmarkSmoother _landmarkSmoother = AdaptiveLandmarkSmoother();
+  late final Ticker _renderTicker;
   late MakeupLook _activeLook;
   late MakeupLook _presetLook;
   MakeupPart _selectedPart = MakeupPart.lips;
@@ -65,10 +61,11 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   bool _isCapturing = false;
   bool _showCaptureFlash = false;
 
-  /// 库默认 0.5。Android 略提高：跟踪置信度不足时更快触发重检测，转头更跟手。
-  double get _meshMinTrackingConfidence => Platform.isAndroid ? 0.65 : 0.5;
-
-  DateTime? _lastHudUpdate;
+  DateTime? _lastMeshFrameTimestamp;
+  DateTime? _performanceWindowStartedAt;
+  int _performanceFrameCount = 0;
+  double _inferenceMsEma = 0;
+  int _consecutiveInferenceErrors = 0;
 
   @override
   void initState() {
@@ -76,6 +73,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     _activeLook = widget.initialLook;
     _presetLook = widget.initialLook;
     WidgetsBinding.instance.addObserver(this);
+    _renderTicker = createTicker(_onRenderTick)..start();
     _bootstrap();
   }
 
@@ -101,7 +99,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       if (mounted) {
         setState(() => _isInitializing = false);
       }
-
+      if (!mounted) return;
       unawaited(_initFaceMeshModels());
     } catch (error) {
       _errorMessage = '$error';
@@ -122,11 +120,12 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   Future<void> _initFaceMeshModels() async {
     try {
       _updateStatus('正在加载人脸模型...');
-      _detector = await _createDetectorProcessor();
-      _meshProcessor = await _createMeshProcessor();
-      _streamProcessor = FaceMeshInferenceStreamProcessor(
-        FaceMeshInferencePipeline(detector: _detector!, mesh: _meshProcessor!),
-      );
+      final worker = await FaceMeshInferenceWorker.start();
+      if (!mounted) {
+        await worker.close();
+        return;
+      }
+      _inferenceWorker = worker;
       if (mounted) {
         setState(() {
           _isModelReady = true;
@@ -143,49 +142,6 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
         _errorMessage ??= '人脸模型加载失败: $error';
       }
     }
-  }
-
-  Future<FaceDetectorProcessor> _createDetectorProcessor() async {
-    return _createWithDelegateFallback(
-      (delegate) => FaceDetectorProcessor.create(
-        model: FaceDetectionModel.shortRange,
-        delegate: delegate,
-        maxResults: 1,
-        roiScaleY: 1.7,
-        roiShiftY: -0.2,
-      ),
-    );
-  }
-
-  Future<FaceMeshProcessor> _createMeshProcessor() async {
-    return _createWithDelegateFallback(
-      (delegate) => FaceMeshProcessor.create(
-        delegate: delegate,
-        minTrackingConfidence: _meshMinTrackingConfidence,
-        // Android 关闭内置平滑，避免与嘴唇 EMA 叠加产生拖影
-        enableSmoothing: !Platform.isAndroid,
-        enableRoiTracking: true,
-        // 口红场景不需要虹膜点，Android 上可省一帧推理
-        enableIris: !Platform.isAndroid,
-      ),
-    );
-  }
-
-  Future<T> _createWithDelegateFallback<T>(
-    Future<T> Function(FaceMeshDelegate delegate) create,
-  ) async {
-    const timeout = Duration(seconds: 20);
-    final delegates = Platform.isAndroid
-        ? [FaceMeshDelegate.xnnpack, FaceMeshDelegate.cpu]
-        : [FaceMeshDelegate.cpu, FaceMeshDelegate.xnnpack];
-    for (final delegate in delegates) {
-      try {
-        return await create(delegate).timeout(timeout);
-      } on TimeoutException {
-        continue;
-      }
-    }
-    throw StateError('人脸模型初始化超时，请重启应用后重试。');
   }
 
   Future<void> _startCamera(CameraDescription camera) async {
@@ -221,99 +177,100 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     await controller.startImageStream(_onCameraFrame);
   }
 
-  void _ensureInferenceStream(int rotationDegrees) {
-    if (_inferenceSubscription != null && _streamRotation == rotationDegrees) {
-      return;
-    }
-    _stopInferenceStream();
-    _streamRotation = rotationDegrees;
+  void _onInferenceResult(
+    FaceMeshResult? mesh, {
+    required DateTime sourceTimestamp,
+    required Duration inferenceDuration,
+  }) {
+    _consecutiveInferenceErrors = 0;
+    final hadFace = _landmarkCount >= 468;
+    _meshResult = mesh;
+    _landmarkCount = mesh?.landmarks.length ?? 0;
+    _lastMeshFrameTimestamp = sourceTimestamp;
+    _updateTrackedLandmarks(mesh, sourceTimestamp: sourceTimestamp);
+    _recordPerformance(inferenceDuration, mesh != null);
 
-    if (Platform.isAndroid) {
-      _nv21Controller = StreamController<FaceMeshNv21Image>();
-      _inferenceSubscription = _streamProcessor!
-          .processNv21(
-            _nv21Controller!.stream,
-            runMeshResolver: (_) => true,
-            rotationDegrees: rotationDegrees,
-          )
-          .listen(_onInferenceResult, onError: _onInferenceError);
-    } else if (Platform.isIOS) {
-      _bgraController = StreamController<FaceMeshImage>();
-      _inferenceSubscription = _streamProcessor!
-          .process(
-            _bgraController!.stream,
-            runMeshResolver: (_) => true,
-            rotationDegrees: rotationDegrees,
-          )
-          .listen(_onInferenceResult, onError: _onInferenceError);
+    if (mounted && hadFace != (_landmarkCount >= 468)) {
+      setState(() {});
     }
   }
 
-  void _onInferenceResult(FaceMeshInferenceResult result) {
-    _inferBusy = false;
-    final mesh = result.meshResult;
-    _updateTrackedLandmarks(mesh);
-
-    final now = DateTime.now();
-    final shouldRefreshHud =
-        _lastHudUpdate == null ||
-        now.difference(_lastHudUpdate!) >= const Duration(milliseconds: 250);
-
-    final refreshSkeleton = _showSkeleton && mesh != null;
-    if (mounted && (shouldRefreshHud || refreshSkeleton)) {
-      if (shouldRefreshHud) {
-        _lastHudUpdate = now;
-      }
-      setState(() {
-        _meshResult = mesh;
-        _landmarkCount = mesh?.landmarks.length ?? 0;
-      });
-    } else {
-      _meshResult = mesh;
-      _landmarkCount = mesh?.landmarks.length ?? 0;
-    }
-
-    unawaited(_processLatestFrame());
-  }
-
-  void _updateTrackedLandmarks(FaceMeshResult? mesh) {
+  void _updateTrackedLandmarks(
+    FaceMeshResult? mesh, {
+    DateTime? sourceTimestamp,
+  }) {
     if (mesh == null || _paintSize == Size.zero) {
       _landmarkSmoother.reset();
       _makeupLandmarks.value = null;
       return;
     }
 
-    final pixels = _landmarkSmoother.smoothToPixelOffsets(
+    final pixels = _landmarkSmoother.observe(
       mesh: mesh,
       targetSize: _paintSize,
       mirrorHorizontal: _mirrorHorizontal,
+      sourceTimestamp: sourceTimestamp ?? _lastMeshFrameTimestamp,
     );
     _makeupLandmarks.value = pixels;
   }
 
+  void _onRenderTick(Duration _) {
+    final now = DateTime.now();
+    if (!_makeupVisible || !_landmarkSmoother.needsPredictionAt(now)) return;
+    final predicted = _landmarkSmoother.predict(displayTimestamp: now);
+    if (predicted != null) _makeupLandmarks.value = predicted;
+  }
+
+  void _recordPerformance(Duration duration, bool trackedFace) {
+    final now = DateTime.now();
+    _performanceWindowStartedAt ??= now;
+    _performanceFrameCount++;
+    final currentMs = duration.inMicroseconds / 1000;
+    _inferenceMsEma = _inferenceMsEma == 0
+        ? currentMs
+        : _inferenceMsEma * 0.82 + currentMs * 0.18;
+
+    final window = now.difference(_performanceWindowStartedAt!);
+    if (window < const Duration(milliseconds: 600)) return;
+    final fps =
+        _performanceFrameCount /
+        (window.inMicroseconds / Duration.microsecondsPerSecond);
+    _trackingPerformance.value = _TrackingPerformance(
+      fps: fps,
+      inferenceMs: _inferenceMsEma,
+      tracking: trackedFace,
+    );
+    _performanceWindowStartedAt = now;
+    _performanceFrameCount = 0;
+  }
+
   void _onInferenceError(Object error) {
-    _inferBusy = false;
-    if (mounted) {
-      setState(() => _errorMessage ??= '$error');
+    _consecutiveInferenceErrors++;
+    _inferenceWorker?.reset();
+    if (mounted && _errorMessage == null && _consecutiveInferenceErrors >= 3) {
+      setState(() => _errorMessage = '$error');
     }
-    unawaited(_processLatestFrame());
   }
 
   void _onCameraFrame(CameraImage image) {
-    if (!_isModelReady || _streamProcessor == null) {
+    if (!_isModelReady || _inferenceWorker == null) {
       return;
     }
-    _pendingCameraImage = image;
+    // 永远只保留最新相机帧，推理来不及时直接丢弃旧帧，避免延迟不断累积。
+    _pendingCameraFrame = _PendingCameraFrame(
+      image: image,
+      receivedAt: DateTime.now(),
+    );
     unawaited(_processLatestFrame());
   }
 
   Future<void> _processLatestFrame() async {
-    if (_inferBusy || !_isModelReady || _streamProcessor == null) {
+    if (_inferBusy || !_isModelReady || _inferenceWorker == null) {
       return;
     }
-    final image = _pendingCameraImage;
+    final pending = _pendingCameraFrame;
     final controller = _cameraController;
-    if (image == null ||
+    if (pending == null ||
         controller == null ||
         !controller.value.isInitialized) {
       return;
@@ -324,44 +281,27 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       return;
     }
 
-    _pendingCameraImage = null;
+    _pendingCameraFrame = null;
     _inferBusy = true;
+    final stopwatch = Stopwatch()..start();
 
     try {
-      if (Platform.isAndroid) {
-        final nv21 = await FaceMeshCameraImageAdapter.toNv21Async(image);
-        if (nv21 == null) {
-          _inferBusy = false;
-          return;
-        }
-        _ensureInferenceStream(rotation);
-        final stream = _nv21Controller;
-        if (stream == null || stream.isClosed) {
-          _inferBusy = false;
-          return;
-        }
-        stream.add(nv21);
-      } else if (Platform.isIOS) {
-        final bgra = FaceMeshCameraImageAdapter.toBgra(image);
-        if (bgra == null) {
-          _inferBusy = false;
-          return;
-        }
-        _ensureInferenceStream(rotation);
-        final stream = _bgraController;
-        if (stream == null || stream.isClosed) {
-          _inferBusy = false;
-          return;
-        }
-        stream.add(bgra);
-      } else {
-        _inferBusy = false;
-      }
+      final result = await _inferenceWorker!.process(
+        pending.image,
+        rotationDegrees: rotation,
+        isAndroid: Platform.isAndroid,
+      );
+      stopwatch.stop();
+      _onInferenceResult(
+        result,
+        sourceTimestamp: pending.receivedAt,
+        inferenceDuration: stopwatch.elapsed,
+      );
     } catch (error) {
+      _onInferenceError(error);
+    } finally {
       _inferBusy = false;
-      if (mounted) {
-        setState(() => _errorMessage ??= '$error');
-      }
+      unawaited(_processLatestFrame());
     }
   }
 
@@ -385,15 +325,13 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   }
 
   void _stopInferenceStream() {
-    _inferenceSubscription?.cancel();
-    _inferenceSubscription = null;
-    _nv21Controller?.close();
-    _bgraController?.close();
-    _nv21Controller = null;
-    _bgraController = null;
-    _streamRotation = null;
     _inferBusy = false;
-    _pendingCameraImage = null;
+    _pendingCameraFrame = null;
+    _inferenceWorker?.reset();
+    _lastMeshFrameTimestamp = null;
+    _performanceWindowStartedAt = null;
+    _performanceFrameCount = 0;
+    _consecutiveInferenceErrors = 0;
   }
 
   @override
@@ -406,6 +344,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       _stopInferenceStream();
       controller.dispose();
       _cameraController = null;
+      unawaited(_inferenceWorker?.close());
+      _inferenceWorker = null;
       _isModelReady = false;
       _meshResult = null;
       _landmarkCount = 0;
@@ -424,11 +364,13 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _renderTicker.dispose();
     _stopInferenceStream();
     _cameraController?.dispose();
-    _detector?.close();
-    _meshProcessor?.close();
+    unawaited(_inferenceWorker?.close());
+    _inferenceWorker = null;
     _makeupLandmarks.dispose();
+    _trackingPerformance.dispose();
     super.dispose();
   }
 
@@ -492,6 +434,42 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
             mirrorHorizontal: mirrorPhoto,
           );
         }, growable: false);
+        if (_activeLook.complexion.enabled) {
+          final faceWidth = MakeupPainterUtils.faceWidth(photoLandmarks);
+          final skinPath = MakeupPainterUtils.skinPath(
+            photoLandmarks,
+            featurePadding: faceWidth * 0.018,
+          );
+          final previewSigma = _skinSmoothingSigma(_activeLook.complexion);
+          final resolutionScale = _paintSize.width > 0
+              ? targetSize.width / _paintSize.width
+              : 1.0;
+          canvas.save();
+          canvas.clipPath(skinPath);
+          canvas.save();
+          if (mirrorPhoto) {
+            canvas.translate(targetSize.width, 0);
+            canvas.scale(-1, 1);
+          }
+          canvas.drawImageRect(
+            source,
+            Rect.fromLTWH(
+              0,
+              0,
+              source.width.toDouble(),
+              source.height.toDouble(),
+            ),
+            Offset.zero & targetSize,
+            Paint()
+              ..filterQuality = FilterQuality.high
+              ..imageFilter = ui.ImageFilter.blur(
+                sigmaX: previewSigma * resolutionScale,
+                sigmaY: previewSigma * resolutionScale,
+              ),
+          );
+          canvas.restore();
+          canvas.restore();
+        }
         MakeupRenderer.paintAll(
           canvas,
           targetSize,
@@ -614,6 +592,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
               final paintSize = Size(width, paintHeight);
               if (_paintSize != paintSize) {
                 _paintSize = paintSize;
+                _landmarkSmoother.reset();
                 _updateTrackedLandmarks(_meshResult);
               }
               return SizedBox(
@@ -640,31 +619,23 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                                     if (pixels == null) {
                                       return const SizedBox.shrink();
                                     }
-                                    return CustomPaint(
-                                      painter: _FullMakeupPainter(
-                                        landmarks: pixels,
-                                        look: _activeLook,
-                                      ),
+                                    return Stack(
+                                      fit: StackFit.expand,
+                                      children: [
+                                        if (_activeLook.complexion.enabled)
+                                          _SkinSmoothingLayer(
+                                            landmarks: pixels,
+                                            config: _activeLook.complexion,
+                                          ),
+                                        CustomPaint(
+                                          painter: _FullMakeupPainter(
+                                            landmarks: pixels,
+                                            look: _activeLook,
+                                          ),
+                                        ),
+                                      ],
                                     );
                                   },
-                                ),
-                              ),
-                            if (_showSkeleton && _meshResult != null)
-                              RepaintBoundary(
-                                child: CustomPaint(
-                                  painter: FaceMeshPainter(
-                                    result: _meshResult!,
-                                    rotationDegrees: 0,
-                                    mirrorHorizontal: _mirrorHorizontal,
-                                    strokeColor: GlamARColors.mesh.withValues(
-                                      alpha: 0.85,
-                                    ),
-                                    irisColor: GlamARColors.meshIris,
-                                    refinedEyeColor: GlamARColors.rose,
-                                    strokeWidth: 0.35,
-                                    drawIris: !Platform.isAndroid,
-                                    drawRefinedEyeEdges: !Platform.isAndroid,
-                                  ),
                                 ),
                               ),
                           ],
@@ -682,7 +653,15 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
           subtitle: _activeLook.subtitle,
           onBack: () => Navigator.of(context).pop(),
           onChangeLook: () => Navigator.of(context).pop(),
-          onDebug: () => setState(() => _showSkeleton = !_showSkeleton),
+        ),
+        Positioned(
+          top: MediaQuery.paddingOf(context).top + 56,
+          right: 12,
+          child: ValueListenableBuilder<_TrackingPerformance>(
+            valueListenable: _trackingPerformance,
+            builder: (context, performance, _) =>
+                _PerformanceBadge(performance: performance),
+          ),
         ),
         Align(
           alignment: Alignment.bottomCenter,
@@ -762,6 +741,60 @@ class _LoadingView extends StatelessWidget {
   }
 }
 
+class _PerformanceBadge extends StatelessWidget {
+  const _PerformanceBadge({required this.performance});
+
+  final _TrackingPerformance performance;
+
+  @override
+  Widget build(BuildContext context) {
+    final ready = performance.fps > 0;
+    final healthy = performance.tracking && performance.fps >= 20;
+    final accent = !ready
+        ? Colors.white54
+        : healthy
+        ? const Color(0xFF8FE3B0)
+        : GlamARColors.rose;
+    return IgnorePointer(
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.42),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.1)),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 5,
+                height: 5,
+                decoration: BoxDecoration(
+                  color: accent,
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                ready
+                    ? 'AR ${performance.fps.round()} FPS  ·  ${performance.inferenceMs.round()} ms'
+                    : 'AR -- FPS',
+                style: TextStyle(
+                  color: Colors.white.withValues(alpha: 0.82),
+                  fontSize: 9,
+                  fontFeatures: const [ui.FontFeature.tabularFigures()],
+                  letterSpacing: 0.2,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _ModelLoadingBanner extends StatelessWidget {
   const _ModelLoadingBanner({required this.message});
 
@@ -811,14 +844,12 @@ class _TopBar extends StatelessWidget {
     required this.subtitle,
     required this.onBack,
     required this.onChangeLook,
-    required this.onDebug,
   });
 
   final String title;
   final String subtitle;
   final VoidCallback onBack;
   final VoidCallback onChangeLook;
-  final VoidCallback onDebug;
 
   @override
   Widget build(BuildContext context) {
@@ -838,31 +869,28 @@ class _TopBar extends StatelessWidget {
               ),
               const SizedBox(width: 6),
               Expanded(
-                child: GestureDetector(
-                  onLongPress: onDebug,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w700,
-                          color: GlamARColors.pearl,
-                        ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                        color: GlamARColors.pearl,
                       ),
-                      Text(
-                        subtitle.toUpperCase(),
-                        style: const TextStyle(
-                          fontSize: 8,
-                          letterSpacing: 1.6,
-                          color: GlamARColors.rose,
-                        ),
+                    ),
+                    Text(
+                      subtitle.toUpperCase(),
+                      style: const TextStyle(
+                        fontSize: 8,
+                        letterSpacing: 1.6,
+                        color: GlamARColors.rose,
                       ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
               ),
               TextButton.icon(
@@ -900,119 +928,53 @@ class _FullMakeupPainter extends CustomPainter {
       oldDelegate.landmarks != landmarks || oldDelegate.look != look;
 }
 
-// ignore: unused_element
-class _BottomHud extends StatelessWidget {
-  const _BottomHud({
-    required this.landmarkCount,
-    required this.fps,
-    required this.showSkeleton,
-    required this.onToggleSkeleton,
-  });
+class _SkinSmoothingLayer extends StatelessWidget {
+  const _SkinSmoothingLayer({required this.landmarks, required this.config});
 
-  final int landmarkCount;
-  final double fps;
-  final bool showSkeleton;
-  final VoidCallback onToggleSkeleton;
+  final List<Offset> landmarks;
+  final MakeupLayerConfig config;
 
   @override
   Widget build(BuildContext context) {
-    final fpsLabel = fps > 0 ? '${fps.toStringAsFixed(0)} fps' : '-- fps';
-
-    return Positioned(
-      left: 16,
-      right: 16,
-      bottom: 28,
-      child: SafeArea(
-        top: false,
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            color: Colors.black.withValues(alpha: 0.45),
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(
-              color: GlamARColors.champagne.withValues(alpha: 0.12),
-            ),
-          ),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            child: Row(
-              children: [
-                _Stat(label: '关键点', value: '$landmarkCount'),
-                const SizedBox(width: 20),
-                _Stat(label: '追踪', value: fpsLabel),
-                const Spacer(),
-                GestureDetector(
-                  onTap: onToggleSkeleton,
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 200),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 8,
-                    ),
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(16),
-                      color: showSkeleton
-                          ? GlamARColors.rose.withValues(alpha: 0.25)
-                          : Colors.white.withValues(alpha: 0.08),
-                      border: Border.all(
-                        color: showSkeleton
-                            ? GlamARColors.rose.withValues(alpha: 0.6)
-                            : Colors.white24,
-                      ),
-                    ),
-                    child: Text(
-                      showSkeleton ? '骨骼 ON' : '骨骼 OFF',
-                      style: TextStyle(
-                        color: showSkeleton
-                            ? GlamARColors.champagne
-                            : Colors.white54,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                        letterSpacing: 0.5,
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
+    final faceWidth = MakeupPainterUtils.faceWidth(landmarks);
+    final sigma = _skinSmoothingSigma(config);
+    return IgnorePointer(
+      child: ClipPath(
+        clipper: _FaceSkinClipper(
+          landmarks: landmarks,
+          featurePadding: faceWidth * 0.018,
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: BackdropFilter(
+          filter: ui.ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
+          blendMode: BlendMode.srcOver,
+          child: const ColoredBox(color: Colors.transparent),
         ),
       ),
     );
   }
 }
 
-class _Stat extends StatelessWidget {
-  const _Stat({required this.label, required this.value});
+double _skinSmoothingSigma(MakeupLayerConfig config) =>
+    0.28 + config.intensity * (0.5 + config.detail * 0.42);
 
-  final String label;
-  final String value;
+class _FaceSkinClipper extends CustomClipper<Path> {
+  const _FaceSkinClipper({
+    required this.landmarks,
+    required this.featurePadding,
+  });
+
+  final List<Offset> landmarks;
+  final double featurePadding;
 
   @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          label,
-          style: TextStyle(
-            color: GlamARColors.champagne.withValues(alpha: 0.5),
-            fontSize: 10,
-            letterSpacing: 0.8,
-          ),
-        ),
-        const SizedBox(height: 2),
-        Text(
-          value,
-          style: const TextStyle(
-            color: GlamARColors.pearl,
-            fontSize: 14,
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-      ],
-    );
-  }
+  Path getClip(Size size) =>
+      MakeupPainterUtils.skinPath(landmarks, featurePadding: featurePadding);
+
+  @override
+  bool shouldReclip(_FaceSkinClipper oldClipper) =>
+      oldClipper.landmarks != landmarks ||
+      oldClipper.featurePadding != featurePadding;
 }
 
 class _HintChip extends StatelessWidget {
@@ -1035,119 +997,6 @@ class _HintChip extends StatelessWidget {
           color: GlamARColors.champagne.withValues(alpha: 0.8),
           fontSize: 11,
           letterSpacing: 0.6,
-        ),
-      ),
-    );
-  }
-}
-
-// ignore: unused_element
-class _LipstickPalette extends StatelessWidget {
-  const _LipstickPalette({required this.selected, required this.onSelect});
-
-  final Color? selected;
-  final ValueChanged<Color?> onSelect;
-
-  static const List<({Color color, String label})> _presets = [
-    (color: Color(0xFFCC2929), label: '红'),
-    (color: Color(0xFFD4607A), label: '玫'),
-    (color: Color(0xFFB87060), label: '裸'),
-    (color: Color(0xFF8B2252), label: '莓'),
-    (color: Color(0xFFE8634F), label: '珊'),
-    (color: Color(0xFF7B2D4E), label: '紫'),
-  ];
-
-  @override
-  Widget build(BuildContext context) {
-    return Positioned(
-      left: 16,
-      right: 16,
-      bottom: 104,
-      child: SafeArea(
-        top: false,
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            color: Colors.black.withValues(alpha: 0.45),
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(
-              color: GlamARColors.champagne.withValues(alpha: 0.12),
-            ),
-          ),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-            child: Row(
-              children: [
-                Text(
-                  '口红',
-                  style: TextStyle(
-                    color: GlamARColors.champagne.withValues(alpha: 0.6),
-                    fontSize: 11,
-                    letterSpacing: 0.8,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: _presets.map((preset) {
-                      final isSelected = selected == preset.color;
-                      return GestureDetector(
-                        onTap: () => onSelect(isSelected ? null : preset.color),
-                        child: AnimatedContainer(
-                          duration: const Duration(milliseconds: 180),
-                          width: 32,
-                          height: 32,
-                          decoration: BoxDecoration(
-                            color: preset.color,
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: isSelected
-                                  ? Colors.white
-                                  : Colors.transparent,
-                              width: 2.5,
-                            ),
-                            boxShadow: isSelected
-                                ? [
-                                    BoxShadow(
-                                      color: preset.color.withValues(
-                                        alpha: 0.6,
-                                      ),
-                                      blurRadius: 8,
-                                      spreadRadius: 1,
-                                    ),
-                                  ]
-                                : null,
-                          ),
-                        ),
-                      );
-                    }).toList(),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                // 清除按钮
-                GestureDetector(
-                  onTap: () => onSelect(null),
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 180),
-                    width: 32,
-                    height: 32,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      border: Border.all(
-                        color: selected == null ? Colors.white : Colors.white30,
-                        width: 2,
-                      ),
-                    ),
-                    child: Icon(
-                      Icons.close,
-                      size: 16,
-                      color: selected == null ? Colors.white : Colors.white38,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
         ),
       ),
     );
@@ -1191,4 +1040,23 @@ class _ErrorView extends StatelessWidget {
       ),
     );
   }
+}
+
+class _PendingCameraFrame {
+  const _PendingCameraFrame({required this.image, required this.receivedAt});
+
+  final CameraImage image;
+  final DateTime receivedAt;
+}
+
+class _TrackingPerformance {
+  const _TrackingPerformance({
+    this.fps = 0,
+    this.inferenceMs = 0,
+    this.tracking = false,
+  });
+
+  final double fps;
+  final double inferenceMs;
+  final bool tracking;
 }

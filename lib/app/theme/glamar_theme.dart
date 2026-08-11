@@ -9,8 +9,6 @@ abstract final class GlamARColors {
   static const roseDeep = Color(0xFFB85C6E);
   static const champagne = Color(0xFFF3E4D4);
   static const pearl = Color(0xFFFFF8F2);
-  static const mesh = Color(0xFF7FFFD4);
-  static const meshIris = Color(0xFFFFB4C8);
 }
 
 abstract final class GlamARTheme {
@@ -35,32 +33,34 @@ abstract final class GlamARTheme {
       brightness: Brightness.dark,
       colorScheme: scheme,
       scaffoldBackgroundColor: GlamARColors.ink,
-      textTheme: bodyFont.apply(
-        bodyColor: GlamARColors.pearl,
-        displayColor: GlamARColors.pearl,
-      ).copyWith(
-        displayLarge: displayFont.displayLarge?.copyWith(
-          fontWeight: FontWeight.w300,
-          letterSpacing: 2,
-          color: GlamARColors.pearl,
-        ),
-        displayMedium: displayFont.displayMedium?.copyWith(
-          fontWeight: FontWeight.w400,
-          color: GlamARColors.champagne,
-        ),
-        titleLarge: bodyFont.titleLarge?.copyWith(
-          fontWeight: FontWeight.w500,
-          letterSpacing: 0.5,
-        ),
-        bodyMedium: bodyFont.bodyMedium?.copyWith(
-          color: GlamARColors.champagne.withValues(alpha: 0.75),
-          height: 1.5,
-        ),
-        labelLarge: bodyFont.labelLarge?.copyWith(
-          fontWeight: FontWeight.w600,
-          letterSpacing: 1.2,
-        ),
-      ),
+      textTheme: bodyFont
+          .apply(
+            bodyColor: GlamARColors.pearl,
+            displayColor: GlamARColors.pearl,
+          )
+          .copyWith(
+            displayLarge: displayFont.displayLarge?.copyWith(
+              fontWeight: FontWeight.w300,
+              letterSpacing: 2,
+              color: GlamARColors.pearl,
+            ),
+            displayMedium: displayFont.displayMedium?.copyWith(
+              fontWeight: FontWeight.w400,
+              color: GlamARColors.champagne,
+            ),
+            titleLarge: bodyFont.titleLarge?.copyWith(
+              fontWeight: FontWeight.w500,
+              letterSpacing: 0.5,
+            ),
+            bodyMedium: bodyFont.bodyMedium?.copyWith(
+              color: GlamARColors.champagne.withValues(alpha: 0.75),
+              height: 1.5,
+            ),
+            labelLarge: bodyFont.labelLarge?.copyWith(
+              fontWeight: FontWeight.w600,
+              letterSpacing: 1.2,
+            ),
+          ),
     );
   }
 }

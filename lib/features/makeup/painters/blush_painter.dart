@@ -14,6 +14,10 @@ class BlushPainter extends CustomPainter {
     final width = MakeupPainterUtils.faceWidth(landmarks);
     final angle = MakeupPainterUtils.angle(landmarks[234], landmarks[454]);
     final faceCenter = landmarks[1];
+    canvas.save();
+    canvas.clipPath(
+      MakeupPainterUtils.closedPath(landmarks, MakeupPainterUtils.faceOval),
+    );
     for (final anchor in <int>[117, 346]) {
       final raw = landmarks[anchor];
       final highTarget = anchor == 117 ? landmarks[50] : landmarks[280];
@@ -44,6 +48,7 @@ class BlushPainter extends CustomPainter {
       );
       canvas.restore();
     }
+    canvas.restore();
   }
 
   @override

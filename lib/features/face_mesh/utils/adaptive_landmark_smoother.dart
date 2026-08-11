@@ -3,29 +3,46 @@ import 'dart:ui';
 
 import 'package:mediapipe_face_mesh/mediapipe_face_mesh.dart';
 
-/// 速度自适应全脸平滑：静止时压制亚像素抖动，转头/表情时提高响应速度。
+/// 面向实时 AR 的关键点滤波器。
+///
+/// 新观测到来时按运动速度自适应抑制抖动；两次推理之间则用头部的平移、
+/// 旋转和缩放速度做短时预测，让 15~30 FPS 的模型结果仍能贴着 60 FPS 预览。
 class AdaptiveLandmarkSmoother {
-  final List<Offset> _state = <Offset>[];
-  DateTime? _lastUpdate;
+  static const _poseAnchors = <int>[1, 10, 33, 152, 234, 263, 454];
+  static const _maxPrediction = Duration(milliseconds: 72);
 
-  List<Offset>? smoothToPixelOffsets({
+  final List<Offset> _positions = <Offset>[];
+  final List<Offset> _velocities = <Offset>[];
+
+  DateTime? _lastSourceTimestamp;
+  Offset _center = Offset.zero;
+  Offset _centerVelocity = Offset.zero;
+  double _faceScale = 1;
+  double _scaleVelocity = 0;
+  double _angle = 0;
+  double _angularVelocity = 0;
+
+  bool get hasFace => _positions.length >= 468;
+
+  bool needsPredictionAt(DateTime timestamp) {
+    if (!hasFace || _lastSourceTimestamp == null) return false;
+    final elapsed = timestamp.difference(_lastSourceTimestamp!);
+    return !elapsed.isNegative && elapsed <= _maxPrediction;
+  }
+
+  /// 接收一帧模型观测，并返回补偿到当前显示时刻的关键点。
+  List<Offset>? observe({
     required FaceMeshResult mesh,
     required Size targetSize,
     required bool mirrorHorizontal,
+    DateTime? sourceTimestamp,
   }) {
     if (mesh.landmarks.length < 468 || targetSize.isEmpty) {
       reset();
       return null;
     }
 
-    final now = DateTime.now();
-    final dt = _lastUpdate == null
-        ? 1 / 30
-        : math.max(
-            1 / 120,
-            now.difference(_lastUpdate!).inMicroseconds / 1000000,
-          );
-    _lastUpdate = now;
+    final timestamp = sourceTimestamp ?? DateTime.now();
     final raw = List<Offset>.generate(mesh.landmarks.length, (index) {
       return mesh.landmarkAsOffset(
         mesh.landmarks[index],
@@ -35,28 +52,178 @@ class AdaptiveLandmarkSmoother {
       );
     }, growable: false);
 
-    if (_state.length != raw.length) {
-      _state
-        ..clear()
-        ..addAll(raw);
-      return List<Offset>.unmodifiable(_state);
+    if (_positions.length != raw.length || _lastSourceTimestamp == null) {
+      _seed(raw, timestamp);
+      return predict();
     }
 
-    final scale = math.max(1.0, (raw[454] - raw[234]).distance);
+    final elapsed = timestamp.difference(_lastSourceTimestamp!);
+    final dt = (elapsed.inMicroseconds / Duration.microsecondsPerSecond).clamp(
+      1 / 120,
+      0.12,
+    );
+    final previousCenter = _center;
+    final previousScale = _faceScale;
+    final previousAngle = _angle;
+    final rawCenter = _average(raw, _poseAnchors);
+    final rawScale = math.max(1.0, (raw[454] - raw[234]).distance);
+    final rawAngle = math.atan2(
+      raw[454].dy - raw[234].dy,
+      raw[454].dx - raw[234].dx,
+    );
+
+    final centerSpeed = (rawCenter - previousCenter).distance / rawScale / dt;
+    final poseResponse = (centerSpeed / 0.72).clamp(0.0, 1.0);
+    final poseAlpha = 0.34 + poseResponse * 0.58;
+
     for (var i = 0; i < raw.length; i++) {
-      final distance = (raw[i] - _state[i]).distance;
-      final normalizedSpeed = distance / scale / dt;
-      final response = (normalizedSpeed / 0.55).clamp(0.0, 1.0);
-      final alpha = 0.2 + response * 0.62;
-      final deadZone = scale * 0.0012;
-      if (distance < deadZone) continue;
-      _state[i] = Offset.lerp(_state[i], raw[i], alpha)!;
+      final previous = _positions[i];
+      final distance = (raw[i] - previous).distance;
+      final normalizedSpeed = distance / rawScale / dt;
+      final response = (normalizedSpeed / 0.58).clamp(0.0, 1.0);
+      final alpha = 0.22 + response * 0.72;
+      final deadZone = rawScale * 0.00075;
+      final next = distance <= deadZone
+          ? previous
+          : Offset.lerp(previous, raw[i], alpha)!;
+      final measuredVelocity = (next - previous) / dt;
+      final velocityAlpha = 0.28 + response * 0.5;
+      _velocities[i] = Offset.lerp(
+        _velocities[i],
+        measuredVelocity,
+        velocityAlpha,
+      )!;
+      _positions[i] = next;
     }
-    return List<Offset>.unmodifiable(_state);
+
+    _center = _average(_positions, _poseAnchors);
+    final measuredCenterVelocity = (_center - previousCenter) / dt;
+    _centerVelocity = Offset.lerp(
+      _centerVelocity,
+      measuredCenterVelocity,
+      poseAlpha,
+    )!;
+
+    _faceScale = math.max(1.0, (_positions[454] - _positions[234]).distance);
+    final measuredScaleVelocity = (_faceScale - previousScale) / dt;
+    _scaleVelocity = _lerpDouble(
+      _scaleVelocity,
+      measuredScaleVelocity,
+      poseAlpha * 0.72,
+    );
+
+    _angle = math.atan2(
+      _positions[454].dy - _positions[234].dy,
+      _positions[454].dx - _positions[234].dx,
+    );
+    final angleDelta = _shortestAngle(_angle - previousAngle);
+    _angularVelocity = _lerpDouble(
+      _angularVelocity,
+      angleDelta / dt,
+      poseAlpha * 0.72,
+    );
+    _lastSourceTimestamp = timestamp;
+    return predict();
   }
+
+  /// 生成显示时刻的预测结果。预测窗口很短，超过上限会自动钳制以免过冲。
+  List<Offset>? predict({DateTime? displayTimestamp}) {
+    if (!hasFace || _lastSourceTimestamp == null) return null;
+    final now = displayTimestamp ?? DateTime.now();
+    final elapsed = now.difference(_lastSourceTimestamp!);
+    final micros = elapsed.inMicroseconds.clamp(
+      0,
+      _maxPrediction.inMicroseconds,
+    );
+    final horizon = micros / Duration.microsecondsPerSecond;
+    if (horizon == 0) return List<Offset>.unmodifiable(_positions);
+
+    final maxTranslation = _faceScale * 0.095;
+    var translation = _centerVelocity * horizon;
+    if (translation.distance > maxTranslation) {
+      translation = translation / translation.distance * maxTranslation;
+    }
+    final scaleFactor = (1 + (_scaleVelocity / _faceScale) * horizon).clamp(
+      0.94,
+      1.06,
+    );
+    final rotation = (_angularVelocity * horizon).clamp(-0.075, 0.075);
+    final cosR = math.cos(rotation);
+    final sinR = math.sin(rotation);
+
+    return List<Offset>.unmodifiable(
+      List<Offset>.generate(_positions.length, (index) {
+        final relative = (_positions[index] - _center) * scaleFactor;
+        final rigid = Offset(
+          relative.dx * cosR - relative.dy * sinR,
+          relative.dx * sinR + relative.dy * cosR,
+        );
+        final localVelocity = _velocities[index] - _centerVelocity;
+        final localLead = localVelocity * (horizon * 0.16);
+        final maxLocalLead = _faceScale * 0.012;
+        final clampedLocalLead = localLead.distance > maxLocalLead
+            ? localLead / localLead.distance * maxLocalLead
+            : localLead;
+        return _center + translation + rigid + clampedLocalLead;
+      }, growable: false),
+    );
+  }
+
+  /// 兼容原先的一次调用式 API。
+  List<Offset>? smoothToPixelOffsets({
+    required FaceMeshResult mesh,
+    required Size targetSize,
+    required bool mirrorHorizontal,
+  }) => observe(
+    mesh: mesh,
+    targetSize: targetSize,
+    mirrorHorizontal: mirrorHorizontal,
+  );
 
   void reset() {
-    _state.clear();
-    _lastUpdate = null;
+    _positions.clear();
+    _velocities.clear();
+    _lastSourceTimestamp = null;
+    _center = Offset.zero;
+    _centerVelocity = Offset.zero;
+    _faceScale = 1;
+    _scaleVelocity = 0;
+    _angle = 0;
+    _angularVelocity = 0;
   }
+
+  void _seed(List<Offset> raw, DateTime timestamp) {
+    _positions
+      ..clear()
+      ..addAll(raw);
+    _velocities
+      ..clear()
+      ..addAll(List<Offset>.filled(raw.length, Offset.zero));
+    _center = _average(raw, _poseAnchors);
+    _faceScale = math.max(1.0, (raw[454] - raw[234]).distance);
+    _angle = math.atan2(raw[454].dy - raw[234].dy, raw[454].dx - raw[234].dx);
+    _lastSourceTimestamp = timestamp;
+  }
+
+  static Offset _average(List<Offset> points, List<int> indices) {
+    var dx = 0.0;
+    var dy = 0.0;
+    for (final index in indices) {
+      dx += points[index].dx;
+      dy += points[index].dy;
+    }
+    return Offset(dx / indices.length, dy / indices.length);
+  }
+
+  static double _shortestAngle(double angle) {
+    while (angle > math.pi) {
+      angle -= math.pi * 2;
+    }
+    while (angle < -math.pi) {
+      angle += math.pi * 2;
+    }
+    return angle;
+  }
+
+  static double _lerpDouble(double a, double b, double t) => a + (b - a) * t;
 }

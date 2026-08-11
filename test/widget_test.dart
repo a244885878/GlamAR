@@ -28,10 +28,7 @@ void main() {
 
     final firstLook = find.byKey(const ValueKey('look-kr-glass'));
     await tester.ensureVisible(firstLook);
-    await tester.drag(
-      find.byType(CustomScrollView),
-      const Offset(0, -180),
-    );
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, -180));
     await tester.pumpAndSettle();
     await tester.tap(firstLook);
     await tester.pumpAndSettle();

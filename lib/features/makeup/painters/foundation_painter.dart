@@ -11,20 +11,21 @@ class FoundationPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     if (!config.enabled || !MakeupPainterUtils.valid(landmarks)) return;
-    final facePath = MakeupPainterUtils.closedPath(
-      landmarks,
-      MakeupPainterUtils.faceOval,
-    );
     final faceWidth = MakeupPainterUtils.faceWidth(landmarks);
     final center = landmarks[1];
+    final skinPath = MakeupPainterUtils.skinPath(
+      landmarks,
+      featurePadding: faceWidth * 0.018,
+    );
 
     canvas.save();
-    canvas.clipPath(facePath);
+    // 底妆只作用于皮肤区域，眼白、眼睑和嘴唇保持原始纹理。
+    canvas.clipPath(skinPath);
 
     canvas.drawPath(
-      facePath,
+      skinPath,
       Paint()
-        ..color = config.color.withValues(alpha: config.intensity * 0.12)
+        ..color = config.color.withValues(alpha: config.intensity * 0.105)
         ..blendMode = BlendMode.softLight,
     );
 
@@ -39,13 +40,37 @@ class FoundationPainter extends CustomPainter {
         ..shader = RadialGradient(
           colors: [
             config.color.withValues(alpha: config.intensity * 0.07),
-            config.color.withValues(alpha: config.intensity * 0.02),
+            const Color(0xFFFFEDE4).withValues(alpha: config.intensity * 0.025),
             Colors.transparent,
           ],
           stops: const [0, 0.7, 1],
         ).createShader(evenToneRect)
         ..blendMode = BlendMode.softLight,
     );
+
+    // 对鼻翼与眼下做非常轻的提亮，模拟逐像素美颜中的肤色均衡层。
+    for (final anchor in <int>[117, 346]) {
+      final underEye = landmarks[anchor];
+      final correctionRect = Rect.fromCenter(
+        center: Offset.lerp(underEye, center, 0.13)!,
+        width: faceWidth * 0.25,
+        height: faceWidth * 0.13,
+      );
+      canvas.drawOval(
+        correctionRect,
+        Paint()
+          ..shader = RadialGradient(
+            colors: [
+              const Color(
+                0xFFFFE9DE,
+              ).withValues(alpha: config.intensity * config.detail * 0.055),
+              Colors.transparent,
+            ],
+          ).createShader(correctionRect)
+          ..blendMode = BlendMode.screen
+          ..maskFilter = MaskFilter.blur(BlurStyle.normal, faceWidth * 0.012),
+      );
+    }
 
     final contourColor = Color.lerp(config.color, Colors.black, 0.72)!;
     for (final anchor in <int>[127, 356]) {
