@@ -48,6 +48,32 @@ void main() {
 
     expect(predicted[1].dx, greaterThan(observed[1].dx));
   });
+
+  test('clamps prediction during a longer tracking dropout', () {
+    final smoother = AdaptiveLandmarkSmoother();
+    final now = DateTime.now();
+    smoother.observe(
+      mesh: _mesh(shiftX: 0),
+      targetSize: targetSize,
+      mirrorHorizontal: false,
+      sourceTimestamp: now.subtract(const Duration(milliseconds: 33)),
+    );
+    smoother.observe(
+      mesh: _mesh(shiftX: 0.018),
+      targetSize: targetSize,
+      mirrorHorizontal: false,
+      sourceTimestamp: now,
+    );
+
+    final clamped = smoother.predict(
+      displayTimestamp: now.add(const Duration(milliseconds: 96)),
+    )!;
+    final muchLater = smoother.predict(
+      displayTimestamp: now.add(const Duration(milliseconds: 400)),
+    )!;
+
+    expect((clamped[1] - muchLater[1]).distance, lessThan(0.001));
+  });
 }
 
 FaceMeshResult _mesh({required double shiftX}) {

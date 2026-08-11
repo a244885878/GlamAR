@@ -9,7 +9,7 @@ import 'package:mediapipe_face_mesh/mediapipe_face_mesh.dart';
 /// 旋转和缩放速度做短时预测，让 15~30 FPS 的模型结果仍能贴着 60 FPS 预览。
 class AdaptiveLandmarkSmoother {
   static const _poseAnchors = <int>[1, 10, 33, 152, 234, 263, 454];
-  static const _maxPrediction = Duration(milliseconds: 72);
+  static const _maxPrediction = Duration(milliseconds: 96);
 
   final List<Offset> _positions = <Offset>[];
   final List<Offset> _velocities = <Offset>[];

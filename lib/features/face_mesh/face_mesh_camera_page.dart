@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
 import 'package:glamar/app/theme/glamar_theme.dart';
 import 'package:glamar/features/face_mesh/utils/adaptive_landmark_smoother.dart';
+import 'package:glamar/features/face_mesh/utils/ar_runtime_governor.dart';
 import 'package:glamar/features/face_mesh/utils/face_occlusion_inference_worker.dart';
 import 'package:glamar/features/face_mesh/utils/face_mesh_inference_worker.dart';
 import 'package:glamar/features/makeup/models/face_render_context.dart';
@@ -71,11 +72,14 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   bool _showCaptureFlash = false;
 
   DateTime? _lastMeshFrameTimestamp;
+  DateTime? _lastValidMeshTimestamp;
   DateTime? _performanceWindowStartedAt;
   int _performanceFrameCount = 0;
   double _inferenceMsEma = 0;
   int _consecutiveInferenceErrors = 0;
   int _consecutiveOcclusionErrors = 0;
+  double _occlusionInferenceMsEma = 0;
+  double _makeupTrackingOpacity = 1;
   DateTime _nextOcclusionAllowedAt = DateTime.fromMillisecondsSinceEpoch(0);
   FaceLighting _faceLighting = FaceLighting.neutral;
   FaceRenderContext _renderContext = const FaceRenderContext.neutral();
@@ -216,12 +220,14 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     _consecutiveInferenceErrors = 0;
     final hadFace = _landmarkCount >= 468;
     _meshResult = mesh;
-    _landmarkCount = mesh?.landmarks.length ?? 0;
+    if (mesh != null) {
+      _landmarkCount = mesh.landmarks.length;
+    }
     _faceLighting = FaceLighting.lerp(_faceLighting, lighting, 0.18);
     if (mesh != null) {
+      _lastValidMeshTimestamp = sourceTimestamp;
+      _makeupTrackingOpacity = 1;
       _renderContext = FaceRenderContext.fromMesh(mesh, _faceLighting);
-    } else {
-      _clearOcclusionTexture();
     }
     _lastMeshFrameTimestamp = sourceTimestamp;
     _updateTrackedLandmarks(mesh, sourceTimestamp: sourceTimestamp);
@@ -236,9 +242,13 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     FaceMeshResult? mesh, {
     DateTime? sourceTimestamp,
   }) {
-    if (mesh == null || _paintSize == Size.zero) {
+    if (_paintSize == Size.zero) {
       _landmarkSmoother.reset();
       _makeupLandmarks.value = null;
+      return;
+    }
+    if (mesh == null) {
+      _updateTrackingBridge(DateTime.now());
       return;
     }
 
@@ -253,9 +263,43 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
 
   void _onRenderTick(Duration _) {
     final now = DateTime.now();
-    if (!_makeupVisible || !_landmarkSmoother.needsPredictionAt(now)) return;
+    if (!_makeupVisible) return;
+    if (_meshResult == null) {
+      _updateTrackingBridge(now);
+      return;
+    }
+    if (!_landmarkSmoother.needsPredictionAt(now)) return;
     final predicted = _landmarkSmoother.predict(displayTimestamp: now);
     if (predicted != null) _makeupLandmarks.value = predicted;
+  }
+
+  void _updateTrackingBridge(DateTime now) {
+    final lastValid = _lastValidMeshTimestamp;
+    if (lastValid == null || !_landmarkSmoother.hasFace) {
+      _expireTrackingBridge();
+      return;
+    }
+    final opacity = ArRuntimeGovernor.trackingOpacity(
+      now.difference(lastValid),
+    );
+    if (opacity <= 0) {
+      _expireTrackingBridge();
+      return;
+    }
+    _makeupTrackingOpacity = opacity;
+    final predicted = _landmarkSmoother.predict(displayTimestamp: now);
+    if (predicted != null) _makeupLandmarks.value = predicted;
+  }
+
+  void _expireTrackingBridge() {
+    final hadFace = _landmarkCount >= 468;
+    _makeupTrackingOpacity = 0;
+    _lastValidMeshTimestamp = null;
+    _landmarkCount = 0;
+    _landmarkSmoother.reset();
+    if (_makeupLandmarks.value != null) _makeupLandmarks.value = null;
+    _clearOcclusionTexture();
+    if (hadFace && mounted) setState(() {});
   }
 
   void _recordPerformance(Duration duration, bool trackedFace) {
@@ -380,7 +424,18 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
         roi: pending.roi,
       );
       _consecutiveOcclusionErrors = 0;
-      await _updateOcclusionTexture(mask);
+      final currentMs = mask.inferenceDuration.inMicroseconds / 1000;
+      _occlusionInferenceMsEma = _occlusionInferenceMsEma == 0
+          ? currentMs
+          : _occlusionInferenceMsEma * 0.78 + currentMs * 0.22;
+      final currentMesh = _meshResult;
+      final bridgeIsActive =
+          currentMesh == null && _lastValidMeshTimestamp != null;
+      if (bridgeIsActive ||
+          (currentMesh != null &&
+              mask.roi.isAlignedWith(_occlusionRoiForMesh(currentMesh)))) {
+        await _updateOcclusionTexture(mask);
+      }
     } catch (_) {
       _consecutiveOcclusionErrors++;
       _occlusionWorker?.reset();
@@ -390,9 +445,13 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       }
     } finally {
       _occlusionBusy = false;
-      // 给 FaceMesh 留出 CPU 时片，遮挡蒙版以稳定性而非高帧率为主。
+      final performance = _trackingPerformance.value;
       _nextOcclusionAllowedAt = DateTime.now().add(
-        const Duration(milliseconds: 70),
+        ArRuntimeGovernor.occlusionCooldown(
+          faceFps: performance.fps,
+          faceInferenceMs: performance.inferenceMs,
+          occlusionInferenceMs: _occlusionInferenceMsEma,
+        ),
       );
     }
   }
@@ -490,6 +549,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     _performanceFrameCount = 0;
     _consecutiveInferenceErrors = 0;
     _consecutiveOcclusionErrors = 0;
+    _occlusionInferenceMsEma = 0;
+    _makeupTrackingOpacity = 1;
     _faceLighting = FaceLighting.neutral;
     _renderContext = const FaceRenderContext.neutral();
   }
@@ -513,6 +574,8 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       _isModelReady = false;
       _meshResult = null;
       _landmarkCount = 0;
+      _lastValidMeshTimestamp = null;
+      _makeupTrackingOpacity = 0;
       _landmarkSmoother.reset();
       _makeupLandmarks.value = null;
     } else if (state == AppLifecycleState.resumed &&
@@ -976,11 +1039,20 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                                       valueListenable: _occlusionTexture,
                                       child: makeup,
                                       builder: (context, texture, child) {
-                                        if (texture == null) return child!;
-                                        return _OcclusionMaskedMakeup(
-                                          texture: texture,
-                                          mirrorHorizontal: _mirrorHorizontal,
-                                          child: child!,
+                                        Widget rendered = child!;
+                                        if (texture != null) {
+                                          rendered = _OcclusionMaskedMakeup(
+                                            texture: texture,
+                                            mirrorHorizontal: _mirrorHorizontal,
+                                            child: rendered,
+                                          );
+                                        }
+                                        if (_makeupTrackingOpacity >= 0.999) {
+                                          return rendered;
+                                        }
+                                        return Opacity(
+                                          opacity: _makeupTrackingOpacity,
+                                          child: rendered,
                                         );
                                       },
                                     );

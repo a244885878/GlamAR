@@ -26,6 +26,24 @@ class FaceOcclusionRoi {
   final double width;
   final double height;
 
+  bool isAlignedWith(FaceOcclusionRoi other) {
+    final referenceWidth = width > other.width ? width : other.width;
+    final referenceHeight = height > other.height ? height : other.height;
+    if (referenceWidth <= 0 || referenceHeight <= 0) return false;
+    final centerX = left + width * 0.5;
+    final centerY = top + height * 0.5;
+    final otherCenterX = other.left + other.width * 0.5;
+    final otherCenterY = other.top + other.height * 0.5;
+    final shiftX = (centerX - otherCenterX).abs() / referenceWidth;
+    final shiftY = (centerY - otherCenterY).abs() / referenceHeight;
+    final widthChange = (width - other.width).abs() / referenceWidth;
+    final heightChange = (height - other.height).abs() / referenceHeight;
+    return shiftX <= 0.22 &&
+        shiftY <= 0.22 &&
+        widthChange <= 0.24 &&
+        heightChange <= 0.24;
+  }
+
   Float64List encode() => Float64List.fromList([left, top, width, height]);
 
   static FaceOcclusionRoi decode(Float64List values) => FaceOcclusionRoi(

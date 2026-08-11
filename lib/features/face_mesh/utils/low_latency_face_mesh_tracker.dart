@@ -16,6 +16,7 @@ class LowLatencyFaceMeshTracker {
   final double minimumUsableScore;
 
   bool _needsDetection = true;
+  int _consecutiveTrackingFailures = 0;
 
   FaceMeshResult? processNv21(
     FaceMeshNv21Image image, {
@@ -64,9 +65,20 @@ class LowLatencyFaceMeshTracker {
   FaceMeshResult? _accept(FaceMeshResult result) {
     final usable =
         result.landmarks.length >= 468 && result.score >= minimumUsableScore;
-    _needsDetection = !usable;
-    return usable ? result : null;
+    if (usable) {
+      _needsDetection = false;
+      _consecutiveTrackingFailures = 0;
+      return result;
+    }
+    _consecutiveTrackingFailures++;
+    // 遮挡或快速转头常会造成单帧低置信度。先给 ROI 跟踪一次自恢复
+    // 机会，连续两帧失效才重跑更贵的人脸检测。
+    _needsDetection = _consecutiveTrackingFailures >= 2;
+    return null;
   }
 
-  void reset() => _needsDetection = true;
+  void reset() {
+    _needsDetection = true;
+    _consecutiveTrackingFailures = 0;
+  }
 }

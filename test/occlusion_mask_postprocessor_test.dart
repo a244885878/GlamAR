@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:glamar/features/face_mesh/utils/face_occlusion_inference_worker.dart';
 import 'package:glamar/features/face_mesh/utils/occlusion_mask_postprocessor.dart';
 
 void main() {
@@ -43,6 +44,30 @@ void main() {
     expect(firstClear, lessThan(visible));
     expect(firstClear, greaterThan(0));
     expect(secondClear, lessThan(firstClear));
+  });
+
+  test('rejects a stale mask after the tracked face moved away', () {
+    const source = FaceOcclusionRoi(
+      left: 0.2,
+      top: 0.2,
+      width: 0.5,
+      height: 0.6,
+    );
+    const close = FaceOcclusionRoi(
+      left: 0.23,
+      top: 0.22,
+      width: 0.49,
+      height: 0.59,
+    );
+    const moved = FaceOcclusionRoi(
+      left: 0.48,
+      top: 0.2,
+      width: 0.4,
+      height: 0.6,
+    );
+
+    expect(source.isAlignedWith(close), isTrue);
+    expect(source.isAlignedWith(moved), isFalse);
   });
 }
 
