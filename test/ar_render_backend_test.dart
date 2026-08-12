@@ -7,6 +7,7 @@ import 'package:glamar/features/face_mesh/models/normalized_face_frame.dart';
 import 'package:glamar/features/makeup/data/makeup_library.dart';
 import 'package:glamar/features/makeup/models/face_render_context.dart';
 import 'package:glamar/features/makeup/models/makeup_look.dart';
+import 'package:glamar/features/makeup/models/makeup_response_curve.dart';
 import 'package:glamar/features/makeup/rendering/ar_render_packet.dart';
 import 'package:glamar/features/makeup/rendering/ar_render_packet_codec.dart';
 import 'package:glamar/features/makeup/rendering/flutter_composite_render_backend.dart';
@@ -47,7 +48,10 @@ void main() {
     expect(uniforms[eyeshadow + ArMakeupMaterialState.enabledOffset], 0);
     expect(
       uniforms[eyeshadow + ArMakeupMaterialState.intensityOffset],
-      closeTo(0.72, 0.0001),
+      closeTo(
+        MakeupResponseCurve.intensity(MakeupPart.eyeshadow, 0.72),
+        0.0001,
+      ),
     );
     expect(
       uniforms[eyeshadow + ArMakeupMaterialState.hasSecondaryColorOffset],
@@ -68,6 +72,8 @@ void main() {
           sideAExposure: 0.5,
           sideBExposure: 0.7,
           warmth: -0.2,
+          skinChroma: 0.24,
+          localContrast: 0.13,
         ),
         sideAVisibility: 0.8,
         sideBVisibility: 0.4,
@@ -96,6 +102,14 @@ void main() {
     expect(state.gpuUniforms[ArFaceRenderState.runtimeDetailQualityOffset], 0);
     expect(state.gpuUniforms[ArFaceRenderState.skinFilterEnabledOffset], 0);
     expect(state.gpuUniforms[ArFaceRenderState.pixelMaterialEnabledOffset], 1);
+    expect(
+      state.gpuUniforms[ArFaceRenderState.skinChromaOffset],
+      closeTo(0.24, 0.0001),
+    );
+    expect(
+      state.gpuUniforms[ArFaceRenderState.localContrastOffset],
+      closeTo(0.13, 0.0001),
+    );
   });
 
   test('reuses dynamic uniforms across prediction-only render ticks', () {

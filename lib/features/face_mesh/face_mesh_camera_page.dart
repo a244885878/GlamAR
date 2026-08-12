@@ -245,8 +245,11 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     if (mesh != null) {
       _landmarkCount = mesh.landmarks.length;
     }
-    _faceLighting = FaceLighting.lerp(_faceLighting, lighting, 0.18);
     if (mesh != null) {
+      // A failed detection carries neutral lighting because no trustworthy
+      // face ROI exists. Preserve the last valid estimate during the tracking
+      // bridge so makeup color does not pulse on a one-frame dropout.
+      _faceLighting = FaceLighting.lerp(_faceLighting, lighting, 0.18);
       _lastValidMeshTimestamp = sourceFrame.capturedAt;
       _makeupTrackingOpacity = 1;
       final observedContext = FaceRenderContext.fromMesh(
@@ -907,6 +910,10 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       );
 
       if (_makeupVisible) {
+        // Capture must consume the same calibrated material parameters as the
+        // realtime backend; otherwise the saved photo looks heavier than the
+        // preview even though both originate from the same UI controls.
+        final photoLook = _materialState.look;
         Future<void> flattenPhotoStage() async {
           final stagePicture = recorder.endRecording();
           final next = await stagePicture.toImage(source.width, source.height);
@@ -952,13 +959,13 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
           _faceLighting,
         );
         final pixelRenderedParts = <MakeupPart>{};
-        if (_activeLook.complexion.enabled) {
+        if (photoLook.complexion.enabled) {
           final faceWidth = MakeupPainterUtils.faceWidth(photoLandmarks);
           final skinPath = MakeupPainterUtils.skinPath(
             photoLandmarks,
             featurePadding: faceWidth * 0.018,
           );
-          final previewSigma = _skinSmoothingSigma(_activeLook.complexion);
+          final previewSigma = _skinSmoothingSigma(photoLook.complexion);
           final resolutionScale = _paintSize.width > 0
               ? targetSize.width / _paintSize.width
               : 1.0;
@@ -967,7 +974,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
             try {
               final shader = (await MakeupShaderPrograms.skin())
                   .fragmentShader();
-              final config = _activeLook.complexion;
+              final config = photoLook.complexion;
               final adaptedColor = photoRenderContext.adaptColor(config.color);
               shader
                 ..setFloat(
@@ -983,7 +990,10 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                   6,
                   config.intensity * photoRenderContext.centralOpacity * 0.055,
                 )
-                ..setFloat(7, 0.66 + config.detail * 0.18);
+                ..setFloat(7, 0.66 + config.detail * 0.18)
+                ..setFloat(8, photoRenderContext.lighting.exposure)
+                ..setFloat(9, photoRenderContext.lighting.skinChroma)
+                ..setFloat(10, photoRenderContext.lighting.localContrast);
               skinPaint.imageFilter = ui.ImageFilter.shader(shader);
               photoShaders.add(shader);
             } catch (_) {
@@ -1005,7 +1015,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
             MakeupPart.blush,
             MakeupPart.eyeshadow,
           ]) {
-            final config = _activeLook.layer(part);
+            final config = photoLook.layer(part);
             if (!config.enabled) continue;
             try {
               final shader = (await MakeupShaderPrograms.colorMaterial())
@@ -1059,12 +1069,11 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
             }
           }
         }
-        if (_activeLook.lips.enabled &&
-            ui.ImageFilter.isShaderFilterSupported) {
+        if (photoLook.lips.enabled && ui.ImageFilter.isShaderFilterSupported) {
           try {
             final lipShader = (await MakeupShaderPrograms.lips())
                 .fragmentShader();
-            final config = _activeLook.lips;
+            final config = photoLook.lips;
             final adaptedColor = photoRenderContext.adaptColor(config.color);
             lipShader
               ..setFloat(2, adaptedColor.r)
@@ -1074,7 +1083,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                 5,
                 config.intensity * photoRenderContext.centralOpacity,
               )
-              ..setFloat(6, switch (_activeLook.lipFinish) {
+              ..setFloat(6, switch (photoLook.lipFinish) {
                 LipFinish.velvet => 0,
                 LipFinish.satin => 0.48,
                 LipFinish.glass => 1,
@@ -1100,7 +1109,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
           canvas,
           targetSize,
           photoLandmarks,
-          _activeLook,
+          photoLook,
           renderContext: photoRenderContext,
           excludedParts: pixelRenderedParts,
         );
@@ -1773,7 +1782,10 @@ class _SkinSmoothingLayerState extends State<_SkinSmoothingLayer> {
       ..setFloat(4, color.g)
       ..setFloat(5, color.b)
       ..setFloat(6, config.intensity * opacity * 0.055)
-      ..setFloat(7, 0.66 + config.detail * 0.18);
+      ..setFloat(7, 0.66 + config.detail * 0.18)
+      ..setFloat(8, widget.renderContext.lighting.exposure)
+      ..setFloat(9, widget.renderContext.lighting.skinChroma)
+      ..setFloat(10, widget.renderContext.lighting.localContrast);
   }
 
   @override
@@ -1783,8 +1795,8 @@ class _SkinSmoothingLayerState extends State<_SkinSmoothingLayer> {
     final filter = shader != null && ui.ImageFilter.isShaderFilterSupported
         ? ui.ImageFilter.shader(shader)
         : ui.ImageFilter.blur(
-            sigmaX: _skinSmoothingSigma(widget.config),
-            sigmaY: _skinSmoothingSigma(widget.config),
+            sigmaX: _skinSmoothingSigma(widget.config) * _fallbackLightingGuard,
+            sigmaY: _skinSmoothingSigma(widget.config) * _fallbackLightingGuard,
           );
     return IgnorePointer(
       child: ClipPath(
@@ -1800,6 +1812,13 @@ class _SkinSmoothingLayerState extends State<_SkinSmoothingLayer> {
         ),
       ),
     );
+  }
+
+  double get _fallbackLightingGuard {
+    final lighting = widget.renderContext.lighting;
+    final exposure = ((lighting.exposure - 0.16) / 0.36).clamp(0.0, 1.0);
+    final contrast = ((lighting.localContrast - 0.035) / 0.145).clamp(0.0, 1.0);
+    return (0.82 + exposure * 0.18) * (0.86 + contrast * 0.14);
   }
 
   @override

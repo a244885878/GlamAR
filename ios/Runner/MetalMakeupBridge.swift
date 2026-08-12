@@ -78,7 +78,7 @@ private struct GlamARRenderFrame {
     let faceCount = Int(data.uint16LE(at: 46))
     guard landmarkCount >= 468,
           materialCount >= Self.materialHeaderLength + 6 * Self.materialLayerStride,
-          faceCount >= 16
+          faceCount >= 18
     else { return nil }
 
     let landmarkFloatCount = landmarkCount * 3
@@ -509,6 +509,8 @@ private final class GlamARMetalLipRenderer {
       frame,
       layerOffset: layer,
       opacity: frame.material[layer + 1] * frame.face[7] * frame.face[12] *
+        (0.82 + Self.smoothStep(0.16, 0.52, frame.face[1]) * 0.18) *
+        (0.86 + Self.smoothStep(0.035, 0.18, frame.face[17]) * 0.14) *
         (frame.face[15] > 0.5 ? 0.045 : 0.105),
       shimmer: detail * runtimeQuality,
       verticalBias: 2
@@ -713,6 +715,18 @@ private final class GlamARMetalLipRenderer {
     let amount = SIMD3<Float>(repeating: abs(warmth) * 0.075)
     primary = simd_mix(primary, target, amount)
     secondary = simd_mix(secondary, target, amount)
+    let chromaGuard = Self.smoothStep(0.035, 0.2, frame.face[16])
+    let contrastGuard = Self.smoothStep(0.045, 0.18, frame.face[17])
+    let saturationScale = 0.86 + chromaGuard * 0.11 + contrastGuard * 0.03
+    primary = Self.scaleSaturation(primary, by: saturationScale)
+    secondary = Self.scaleSaturation(secondary, by: saturationScale)
+    let exposureDelta = min(max(frame.face[1] - 0.52, -0.42), 0.42)
+    let lightnessShift = exposureDelta * 0.035 - max(exposureDelta, 0) * 0.04
+    let shift = SIMD3<Float>(repeating: lightnessShift)
+    let lower = SIMD3<Float>(repeating: 0)
+    let upper = SIMD3<Float>(repeating: 1)
+    primary = simd_clamp(primary + shift, lower, upper)
+    secondary = simd_clamp(secondary + shift, lower, upper)
     return GlamARColorMeshUniforms(
       primaryColor: SIMD4<Float>(primary.x, primary.y, primary.z, 1),
       secondaryColor: SIMD4<Float>(secondary.x, secondary.y, secondary.z, 1),
@@ -921,6 +935,17 @@ private final class GlamARMetalLipRenderer {
       ? SIMD3<Float>(1, 0.698, 0.561)
       : SIMD3<Float>(0.624, 0.737, 0.91)
     color = simd_mix(color, warmthTarget, SIMD3<Float>(repeating: abs(warmth) * 0.075))
+    let chromaGuard = Self.smoothStep(0.035, 0.2, frame.face[16])
+    let contrastGuard = Self.smoothStep(0.045, 0.18, frame.face[17])
+    let saturationScale = 0.86 + chromaGuard * 0.11 + contrastGuard * 0.03
+    color = Self.scaleSaturation(color, by: saturationScale)
+    let exposureDelta = min(max(frame.face[1] - 0.52, -0.42), 0.42)
+    let lightnessShift = exposureDelta * 0.035 - max(exposureDelta, 0) * 0.04
+    color = simd_clamp(
+      color + SIMD3<Float>(repeating: lightnessShift),
+      SIMD3<Float>(repeating: 0),
+      SIMD3<Float>(repeating: 1)
+    )
     let centralOpacity = min(max((0.78 + frame.face[1] * 0.42) * frame.face[7], 0.64), 1.1)
     let materialMix: Float = frame.face[15] > 0.5 ? 0.34 : 1
     let alpha = min(max(
@@ -980,6 +1005,19 @@ private final class GlamARMetalLipRenderer {
   private static func smoothStep(_ edge0: Float, _ edge1: Float, _ value: Float) -> Float {
     let t = min(max((value - edge0) / max(edge1 - edge0, 0.0001), 0), 1)
     return t * t * (3 - 2 * t)
+  }
+
+  private static func scaleSaturation(
+    _ color: SIMD3<Float>,
+    by scale: Float
+  ) -> SIMD3<Float> {
+    let luminance = simd_dot(color, SIMD3<Float>(0.2126, 0.7152, 0.0722))
+    let gray = SIMD3<Float>(repeating: luminance)
+    return simd_clamp(
+      gray + (color - gray) * scale,
+      SIMD3<Float>(repeating: 0),
+      SIMD3<Float>(repeating: 1)
+    )
   }
 
   static let shaderSource = """

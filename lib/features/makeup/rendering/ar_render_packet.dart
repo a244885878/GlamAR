@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:glamar/features/face_mesh/models/normalized_face_frame.dart';
 import 'package:glamar/features/makeup/models/face_render_context.dart';
 import 'package:glamar/features/makeup/models/makeup_look.dart';
+import 'package:glamar/features/makeup/models/makeup_response_curve.dart';
 
 /// Native GPU 后端与 Flutter 兼容后端共用的妆容参数块。
 ///
@@ -9,8 +10,15 @@ import 'package:glamar/features/makeup/models/makeup_look.dart';
 /// offset 读取 [gpuUniforms]，无需在 platform channel 中传递颜色对象。
 @immutable
 class ArMakeupMaterialState {
-  ArMakeupMaterialState.fromLook(this.look)
-    : gpuUniforms = _encodeMaterialUniforms(look);
+  factory ArMakeupMaterialState.fromLook(MakeupLook source) {
+    final calibrated = MakeupResponseCurve.look(source);
+    return ArMakeupMaterialState._(
+      calibrated,
+      _encodeMaterialUniforms(calibrated),
+    );
+  }
+
+  const ArMakeupMaterialState._(this.look, this.gpuUniforms);
 
   static const int protocolVersion = 1;
   static const int headerLength = 4;
@@ -36,6 +44,7 @@ class ArMakeupMaterialState {
   static int layerOffset(MakeupPart part) =>
       headerLength + part.index * layerStride;
 
+  /// 供所有渲染后端使用的校准后妆容；UI 状态仍保留原始控制值。
   final MakeupLook look;
 
   /// 读取时视为不可变；每次调妆才会构建新实例。
@@ -98,7 +107,7 @@ class ArFaceRenderState {
        );
 
   static const int protocolVersion = 1;
-  static const int uniformLength = 16;
+  static const int uniformLength = 18;
 
   static const int versionOffset = 0;
   static const int exposureOffset = 1;
@@ -116,6 +125,8 @@ class ArFaceRenderState {
   static const int runtimeDetailQualityOffset = 13;
   static const int skinFilterEnabledOffset = 14;
   static const int pixelMaterialEnabledOffset = 15;
+  static const int skinChromaOffset = 16;
+  static const int localContrastOffset = 17;
 
   final FaceRenderContext context;
   final double trackingOpacity;
@@ -154,6 +165,8 @@ class ArFaceRenderState {
       runtimeDetailQuality.clamp(0.0, 1.0).toDouble(),
       skinFilterEnabled ? 1 : 0,
       pixelMaterialEnabled ? 1 : 0,
+      lighting.skinChroma.clamp(0.0, 1.0).toDouble(),
+      lighting.localContrast.clamp(0.0, 1.0).toDouble(),
     ]);
   }
 }
@@ -161,7 +174,7 @@ class ArFaceRenderState {
 /// 避免在仅更新预测顶点的 vsync 上重复分配 dynamic uniform。
 ///
 /// 人脸推理产生新 [FaceRenderContext] 或性能档位变化时才重建；
-/// 普通的 60Hz 跟踪预测帧直接复用上一块 16-float buffer。
+/// 普通的 60Hz 跟踪预测帧直接复用上一块 18-float buffer。
 class ArFaceRenderStateCache {
   ArFaceRenderState? _cached;
 

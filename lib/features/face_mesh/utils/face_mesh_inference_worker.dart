@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:isolate';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
@@ -169,6 +170,8 @@ class FaceMeshInferenceWorker {
       sideAExposure: encoded[1],
       sideBExposure: encoded[2],
       warmth: encoded[3],
+      skinChroma: encoded.length > 4 ? encoded[4] : 0.18,
+      localContrast: encoded.length > 5 ? encoded[5] : 0.16,
     );
   }
 
@@ -464,6 +467,8 @@ Float32List _encodeLighting(FaceLighting lighting) => Float32List.fromList([
   lighting.sideAExposure,
   lighting.sideBExposure,
   lighting.warmth,
+  lighting.skinChroma,
+  lighting.localContrast,
 ]);
 
 FaceLighting _analyzeNv21Lighting(
@@ -480,12 +485,17 @@ FaceLighting _analyzeNv21Lighting(
     final luma = ((image.yPlane[yIndex] - 16) / 219).clamp(0.0, 1.0);
     final uvIndex = (py ~/ 2) * image.vuBytesPerRow + (px ~/ 2) * 2;
     var warmth = 0.0;
+    var u = 128;
+    var v = 128;
     if (uvIndex + 1 < image.vuPlane.length) {
-      final v = image.vuPlane[uvIndex];
-      final u = image.vuPlane[uvIndex + 1];
+      v = image.vuPlane[uvIndex];
+      u = image.vuPlane[uvIndex + 1];
       warmth = ((v - u) / 170).clamp(-1.0, 1.0);
     }
-    return (luma: luma, warmth: warmth);
+    final uDelta = (u - 128) / 128;
+    final vDelta = (v - 128) / 128;
+    final chroma = math.sqrt(uDelta * uDelta + vDelta * vDelta).clamp(0.0, 1.0);
+    return (luma: luma, warmth: warmth, chroma: chroma);
   });
 }
 
@@ -504,13 +514,20 @@ FaceLighting _analyzeBgraLighting(
     final green = image.pixels[index + 1] / 255;
     final red = image.pixels[index + 2] / 255;
     final luma = red * 0.2126 + green * 0.7152 + blue * 0.0722;
-    return (luma: luma, warmth: ((red - blue) * 1.55).clamp(-1.0, 1.0));
+    final maximum = math.max(red, math.max(green, blue));
+    final minimum = math.min(red, math.min(green, blue));
+    return (
+      luma: luma,
+      warmth: ((red - blue) * 1.55).clamp(-1.0, 1.0),
+      chroma: (maximum - minimum).clamp(0.0, 1.0),
+    );
   });
 }
 
 FaceLighting _analyzeLighting(
   FaceMeshResult mesh,
-  ({double luma, double warmth})? Function(double x, double y) sample,
+  ({double luma, double warmth, double chroma})? Function(double x, double y)
+  sample,
 ) {
   final points = mesh.landmarks;
   var minX = 1.0;
@@ -531,9 +548,12 @@ FaceLighting _analyzeLighting(
   minY += height * 0.16;
   maxY -= height * 0.1;
   final centerX = (minX + maxX) * 0.5;
+  final featureRegions = _lightingFeatureRegions(points);
 
   var total = 0.0;
   var warmth = 0.0;
+  var chroma = 0.0;
+  var lumaSquared = 0.0;
   var count = 0;
   var leftTotal = 0.0;
   var leftCount = 0;
@@ -546,10 +566,16 @@ FaceLighting _analyzeLighting(
       final dx = (x - centerX) / ((maxX - minX) * 0.5);
       final dy = (y - (minY + maxY) * 0.5) / ((maxY - minY) * 0.5);
       if (dx * dx + dy * dy > 0.92) continue;
+      // Skin statistics must not be biased by naturally dark eyes/brows or
+      // saturated lips. This is especially important for chroma and local
+      // contrast guards, which otherwise make the makeup breathe on blinks.
+      if (_insideFeatureRegion(featureRegions, x, y)) continue;
       final value = sample(x, y);
       if (value == null) continue;
       total += value.luma;
       warmth += value.warmth;
+      chroma += value.chroma;
+      lumaSquared += value.luma * value.luma;
       count++;
       if (x < centerX) {
         leftTotal += value.luma;
@@ -562,6 +588,7 @@ FaceLighting _analyzeLighting(
   }
   if (count == 0) return FaceLighting.neutral;
   final average = total / count;
+  final variance = math.max(0, lumaSquared / count - average * average);
   final left = leftCount == 0 ? average : leftTotal / leftCount;
   final right = rightCount == 0 ? average : rightTotal / rightCount;
   final sideAOnLeft = points.length > 117 && points[117].x < centerX;
@@ -570,7 +597,64 @@ FaceLighting _analyzeLighting(
     sideAExposure: sideAOnLeft ? left : right,
     sideBExposure: sideAOnLeft ? right : left,
     warmth: (warmth / count).clamp(-1.0, 1.0),
+    skinChroma: (chroma / count).clamp(0.0, 1.0),
+    localContrast: math.sqrt(variance).clamp(0.0, 1.0),
   );
+}
+
+typedef _LightingFeatureRegion = ({
+  double centerX,
+  double centerY,
+  double radiusX,
+  double radiusY,
+});
+
+List<_LightingFeatureRegion> _lightingFeatureRegions(
+  List<FaceMeshLandmark> points,
+) {
+  if (points.length < 468) return const <_LightingFeatureRegion>[];
+  return <_LightingFeatureRegion>[
+    _landmarkEllipse(points, 33, 133, 0.72, 0.36),
+    _landmarkEllipse(points, 362, 263, 0.72, 0.36),
+    _landmarkEllipse(points, 61, 291, 0.62, 0.27),
+  ];
+}
+
+_LightingFeatureRegion _landmarkEllipse(
+  List<FaceMeshLandmark> points,
+  int firstIndex,
+  int secondIndex,
+  double radiusXScale,
+  double radiusYScale,
+) {
+  final first = points[firstIndex];
+  final second = points[secondIndex];
+  final centerX = (first.x + second.x) * 0.5;
+  final centerY = (first.y + second.y) * 0.5;
+  final spanX = first.x - second.x;
+  final spanY = first.y - second.y;
+  final width = math.max(math.sqrt(spanX * spanX + spanY * spanY), 0.0001);
+  return (
+    centerX: centerX,
+    centerY: centerY,
+    radiusX: width * radiusXScale,
+    radiusY: width * radiusYScale,
+  );
+}
+
+bool _insideFeatureRegion(
+  List<_LightingFeatureRegion> regions,
+  double x,
+  double y,
+) {
+  for (final region in regions) {
+    final normalizedX = (x - region.centerX) / region.radiusX;
+    final normalizedY = (y - region.centerY) / region.radiusY;
+    if (normalizedX * normalizedX + normalizedY * normalizedY <= 1) {
+      return true;
+    }
+  }
+  return false;
 }
 
 (double, double) _logicalToRaw(double x, double y, int rotation) {

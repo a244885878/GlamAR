@@ -10,12 +10,16 @@ class FaceLighting {
     this.sideAExposure = 0.52,
     this.sideBExposure = 0.52,
     this.warmth = 0,
+    this.skinChroma = 0.18,
+    this.localContrast = 0.16,
   });
 
   final double exposure;
   final double sideAExposure;
   final double sideBExposure;
   final double warmth;
+  final double skinChroma;
+  final double localContrast;
 
   static const neutral = FaceLighting();
 
@@ -25,6 +29,8 @@ class FaceLighting {
       sideAExposure: _lerp(a.sideAExposure, b.sideAExposure, t),
       sideBExposure: _lerp(a.sideBExposure, b.sideBExposure, t),
       warmth: _lerp(a.warmth, b.warmth, t),
+      skinChroma: _lerp(a.skinChroma, b.skinChroma, t),
+      localContrast: _lerp(a.localContrast, b.localContrast, t),
     );
   }
 
@@ -194,7 +200,26 @@ class FaceRenderContext {
     final target = lighting.warmth >= 0
         ? const Color(0xFFFFB28F)
         : const Color(0xFF9FBCE8);
-    return Color.lerp(source, target, lighting.warmth.abs() * 0.075)!;
+    final temperatureAdapted = Color.lerp(
+      source,
+      target,
+      lighting.warmth.abs() * 0.075,
+    )!;
+    final hsl = HSLColor.fromColor(temperatureAdapted);
+    final exposureDelta = (lighting.exposure - 0.52).clamp(-0.42, 0.42);
+    final chromaGuard = _smoothStep(0.035, 0.2, lighting.skinChroma);
+    final contrastGuard = _smoothStep(0.045, 0.18, lighting.localContrast);
+    // 暗光/低色度环境适度收敛饱和度，避免红色和紫色浮在脸上；高光下
+    // 略微压低明度，防止浅色底妆与腮红被相机 ISP 推成粉白色块。
+    final saturationScale = 0.86 + chromaGuard * 0.11 + contrastGuard * 0.03;
+    final protectedLightness =
+        hsl.lightness +
+        exposureDelta * 0.035 -
+        math.max(exposureDelta, 0) * 0.04;
+    return hsl
+        .withSaturation((hsl.saturation * saturationScale).clamp(0.0, 1.0))
+        .withLightness(protectedLightness.clamp(0.06, 0.92))
+        .toColor();
   }
 
   static double _distance(FaceMeshLandmark a, FaceMeshLandmark b) {

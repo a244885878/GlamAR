@@ -149,6 +149,41 @@ void main() {
     expect((adapted.g - source.g).abs(), lessThan(0.08));
     expect((adapted.b - source.b).abs(), lessThan(0.08));
   });
+
+  test('low-chroma low-contrast light prevents floating makeup color', () {
+    const source = Color(0xFFD73C68);
+    const protected = FaceRenderContext(
+      lighting: FaceLighting(
+        exposure: 0.3,
+        skinChroma: 0.02,
+        localContrast: 0.02,
+      ),
+    );
+    const normal = FaceRenderContext(
+      lighting: FaceLighting(
+        exposure: 0.52,
+        skinChroma: 0.24,
+        localContrast: 0.2,
+      ),
+    );
+
+    final protectedHsl = HSLColor.fromColor(protected.adaptColor(source));
+    final normalHsl = HSLColor.fromColor(normal.adaptColor(source));
+    expect(protectedHsl.saturation, lessThan(normalHsl.saturation));
+    expect(
+      (protectedHsl.lightness - normalHsl.lightness).abs(),
+      lessThan(0.04),
+    );
+  });
+
+  test('lighting interpolation includes chroma and local contrast', () {
+    const start = FaceLighting(skinChroma: 0.04, localContrast: 0.08);
+    const end = FaceLighting(skinChroma: 0.28, localContrast: 0.2);
+    final result = FaceLighting.lerp(start, end, 0.25);
+
+    expect(result.skinChroma, closeTo(0.1, 0.0001));
+    expect(result.localContrast, closeTo(0.11, 0.0001));
+  });
 }
 
 FaceMeshResult _expressionMesh({

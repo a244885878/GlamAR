@@ -76,7 +76,7 @@ private data class GlamArRenderFrame(
             val landmarkCount = data.getInt(start + 40)
             val materialCount = data.getShort(start + 44).toInt() and 0xffff
             val faceCount = data.getShort(start + 46).toInt() and 0xffff
-            if (landmarkCount < 468 || materialCount < 76 || faceCount < 16) return null
+            if (landmarkCount < 468 || materialCount < 76 || faceCount < 18) return null
             val vertexFloatCount = landmarkCount * 3
             val expected = HEADER_LENGTH + (vertexFloatCount + materialCount + faceCount) * 4
             if (data.remaining() != expected) return null
@@ -628,6 +628,8 @@ private class GlamArOpenGlRenderer(
             indexBuffer = foundationIndexBufferId,
             indexCount = foundationIndexCount,
             opacity = frame.material[layer + 1] * frame.face[7] * frame.face[12] *
+                (0.82f + smoothStep(0.16f, 0.52f, frame.face[1]) * 0.18f) *
+                (0.86f + smoothStep(0.035f, 0.18f, frame.face[17]) * 0.14f) *
                 if (frame.face[15] > 0.5f) 0.045f else 0.105f,
             shimmer = detail * runtimeQuality,
             verticalBias = 2f,
@@ -815,6 +817,25 @@ private class GlamArOpenGlRenderer(
         secondaryRed += (targetRed - secondaryRed) * warmthMix
         secondaryGreen += (targetGreen - secondaryGreen) * warmthMix
         secondaryBlue += (targetBlue - secondaryBlue) * warmthMix
+        val chromaGuard = smoothStep(0.035f, 0.2f, frame.face[16])
+        val contrastGuard = smoothStep(0.045f, 0.18f, frame.face[17])
+        val saturationScale = 0.86f + chromaGuard * 0.11f + contrastGuard * 0.03f
+        val primaryLuma = primaryRed * 0.2126f + primaryGreen * 0.7152f + primaryBlue * 0.0722f
+        primaryRed = (primaryLuma + (primaryRed - primaryLuma) * saturationScale).coerceIn(0f, 1f)
+        primaryGreen = (primaryLuma + (primaryGreen - primaryLuma) * saturationScale).coerceIn(0f, 1f)
+        primaryBlue = (primaryLuma + (primaryBlue - primaryLuma) * saturationScale).coerceIn(0f, 1f)
+        val secondaryLuma = secondaryRed * 0.2126f + secondaryGreen * 0.7152f + secondaryBlue * 0.0722f
+        secondaryRed = (secondaryLuma + (secondaryRed - secondaryLuma) * saturationScale).coerceIn(0f, 1f)
+        secondaryGreen = (secondaryLuma + (secondaryGreen - secondaryLuma) * saturationScale).coerceIn(0f, 1f)
+        secondaryBlue = (secondaryLuma + (secondaryBlue - secondaryLuma) * saturationScale).coerceIn(0f, 1f)
+        val exposureDelta = (frame.face[1] - 0.52f).coerceIn(-0.42f, 0.42f)
+        val lightnessShift = exposureDelta * 0.035f - max(exposureDelta, 0f) * 0.04f
+        primaryRed = (primaryRed + lightnessShift).coerceIn(0f, 1f)
+        primaryGreen = (primaryGreen + lightnessShift).coerceIn(0f, 1f)
+        primaryBlue = (primaryBlue + lightnessShift).coerceIn(0f, 1f)
+        secondaryRed = (secondaryRed + lightnessShift).coerceIn(0f, 1f)
+        secondaryGreen = (secondaryGreen + lightnessShift).coerceIn(0f, 1f)
+        secondaryBlue = (secondaryBlue + lightnessShift).coerceIn(0f, 1f)
         GLES20.glUniform4f(primaryColorLocation, primaryRed, primaryGreen, primaryBlue, 1f)
         GLES20.glUniform4f(secondaryColorLocation, secondaryRed, secondaryGreen, secondaryBlue, 1f)
         GLES20.glUniform4f(
@@ -1085,6 +1106,18 @@ private class GlamArOpenGlRenderer(
         red += (targetRed - red) * warmthMix
         green += (targetGreen - green) * warmthMix
         blue += (targetBlue - blue) * warmthMix
+        val chromaGuard = smoothStep(0.035f, 0.2f, frame.face[16])
+        val contrastGuard = smoothStep(0.045f, 0.18f, frame.face[17])
+        val saturationScale = 0.86f + chromaGuard * 0.11f + contrastGuard * 0.03f
+        val luminance = red * 0.299f + green * 0.587f + blue * 0.114f
+        red = luminance + (red - luminance) * saturationScale
+        green = luminance + (green - luminance) * saturationScale
+        blue = luminance + (blue - luminance) * saturationScale
+        val exposureDelta = (frame.face[1] - 0.52f).coerceIn(-0.42f, 0.42f)
+        val lightnessShift = exposureDelta * 0.035f - max(exposureDelta, 0f) * 0.04f
+        red = (red + lightnessShift).coerceIn(0f, 1f)
+        green = (green + lightnessShift).coerceIn(0f, 1f)
+        blue = (blue + lightnessShift).coerceIn(0f, 1f)
         val centralOpacity = ((0.78f + frame.face[1] * 0.42f) * frame.face[7]).coerceIn(0.64f, 1.1f)
         val materialMix = if (frame.face[15] > 0.5f) 0.34f else 1f
         val alpha = (
