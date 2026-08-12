@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:glamar/app/theme/glamar_theme.dart';
 import 'package:glamar/features/makeup/data/makeup_library.dart';
 import 'package:glamar/main.dart';
 
@@ -21,9 +22,20 @@ void main() {
     expect(find.text('今天，想成为谁？'), findsOneWidget);
     expect(find.text('韩系'), findsOneWidget);
     expect(find.text('日系'), findsOneWidget);
+    final koreanLabel = tester.widget<Text>(find.text('韩系'));
+    expect(koreanLabel.style?.color, GlamARColors.pearl);
 
     await tester.tap(find.text('韩系'));
     await tester.pumpAndSettle();
+    final catalogTitle = tester.widget<Text>(find.text('韩系精选'));
+    expect(catalogTitle.style?.color, GlamARColors.pearl);
+    final flexibleSpace = tester.widget<FlexibleSpaceBar>(
+      find.byType(FlexibleSpaceBar),
+    );
+    expect(
+      flexibleSpace.titlePadding,
+      const EdgeInsets.fromLTRB(64, 0, 24, 18),
+    );
     expect(find.text('水光蔷薇'), findsOneWidget);
 
     final firstLook = find.byKey(const ValueKey('look-kr-glass'));

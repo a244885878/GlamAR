@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -36,10 +37,7 @@ class FaceMeshInferenceWorker {
   bool _closed = false;
 
   static Future<FaceMeshInferenceWorker> start() async {
-    final rootToken = RootIsolateToken.instance;
-    if (rootToken == null) {
-      throw StateError('无法取得 Flutter RootIsolateToken');
-    }
+    final modelPaths = await _materializeFaceModels();
 
     final receivePort = ReceivePort();
     final ready = Completer<SendPort>();
@@ -62,7 +60,7 @@ class FaceMeshInferenceWorker {
 
     final isolate = await Isolate.spawn<List<Object?>>(
       _faceMeshWorkerMain,
-      <Object?>[receivePort.sendPort, rootToken],
+      <Object?>[receivePort.sendPort, modelPaths.detector, modelPaths.mesh],
       debugName: 'GlamARFaceMesh',
     );
 
@@ -205,15 +203,15 @@ class FaceMeshInferenceWorker {
 
 Future<void> _faceMeshWorkerMain(List<Object?> bootstrap) async {
   final resultPort = bootstrap[0]! as SendPort;
-  final rootToken = bootstrap[1]! as RootIsolateToken;
-  BackgroundIsolateBinaryMessenger.ensureInitialized(rootToken);
+  final detectorModelPath = bootstrap[1]! as String;
+  final meshModelPath = bootstrap[2]! as String;
   final commandPort = ReceivePort();
 
   FaceDetectorProcessor? detector;
   FaceMeshProcessor? mesh;
   try {
-    detector = await _createDetector();
-    mesh = await _createMesh();
+    detector = await _createDetector(detectorModelPath);
+    mesh = await _createMesh(meshModelPath);
   } catch (error) {
     detector?.close();
     mesh?.close();
@@ -264,20 +262,23 @@ Future<void> _faceMeshWorkerMain(List<Object?> bootstrap) async {
   commandPort.close();
 }
 
-Future<FaceDetectorProcessor> _createDetector() => _createWithFallback(
-  (delegate) => FaceDetectorProcessor.create(
-    model: FaceDetectionModel.shortRange,
-    delegate: delegate,
-    threads: 4,
-    allowDelegateFallback: false,
-    maxResults: 1,
-    roiScaleY: 1.7,
-    roiShiftY: -0.2,
-  ),
-);
+Future<FaceDetectorProcessor> _createDetector(String modelPath) =>
+    _createWithFallback(
+      (delegate) => FaceDetectorProcessor.createFromModelPath(
+        modelPath,
+        model: FaceDetectionModel.shortRange,
+        delegate: delegate,
+        threads: 4,
+        allowDelegateFallback: false,
+        maxResults: 1,
+        roiScaleY: 1.7,
+        roiShiftY: -0.2,
+      ),
+    );
 
-Future<FaceMeshProcessor> _createMesh() => _createWithFallback(
-  (delegate) => FaceMeshProcessor.create(
+Future<FaceMeshProcessor> _createMesh(String modelPath) => _createWithFallback(
+  (delegate) => FaceMeshProcessor.createFromModelPath(
+    modelPath,
     delegate: delegate,
     threads: 4,
     allowDelegateFallback: false,
@@ -287,6 +288,34 @@ Future<FaceMeshProcessor> _createMesh() => _createWithFallback(
     enableIris: false,
   ),
 );
+
+const _detectorModelAsset =
+    'packages/mediapipe_face_mesh/assets/models/face_detection_short_range.tflite';
+const _meshModelAsset =
+    'packages/mediapipe_face_mesh/assets/models/mediapipe_face_mesh.tflite';
+
+Future<({String detector, String mesh})> _materializeFaceModels() async {
+  final cache = Directory('${Directory.systemTemp.path}/glamar_face_models');
+  await cache.create(recursive: true);
+  final detector = await _materializeModelAsset(
+    _detectorModelAsset,
+    File('${cache.path}/face_detection_short_range.tflite'),
+  );
+  final mesh = await _materializeModelAsset(
+    _meshModelAsset,
+    File('${cache.path}/mediapipe_face_mesh.tflite'),
+  );
+  return (detector: detector, mesh: mesh);
+}
+
+Future<String> _materializeModelAsset(String asset, File target) async {
+  final data = await rootBundle.load(asset);
+  final bytes = data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+  if (!await target.exists() || await target.length() != bytes.length) {
+    await target.writeAsBytes(bytes, flush: true);
+  }
+  return target.path;
+}
 
 Future<T> _createWithFallback<T>(
   Future<T> Function(FaceMeshDelegate delegate) create,

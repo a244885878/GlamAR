@@ -112,7 +112,8 @@ class NativeGpuRenderBackend implements ArNativeTextureRenderBackend {
             'pixelHeight': 1280,
             'faceMeshIndices': NativeFaceMeshTopology.skinIndices.buffer
                 .asUint8List(),
-          });
+          })
+          .timeout(const Duration(seconds: 6));
       if (_disposed) {
         unawaited(
           _controlChannel.invokeMethod<void>('dispose').catchError((_) {}),
@@ -136,6 +137,10 @@ class NativeGpuRenderBackend implements ArNativeTextureRenderBackend {
       // GPU 不可用时始终保持 Flutter 兼容面。
     } on MissingPluginException {
       // Widget 测试和非移动端引擎没有原生通道。
+    } catch (_) {
+      // Timeout, engine teardown and vendor channel errors all fail closed to
+      // the Flutter compositor. Initialization runs unawaited by design, so no
+      // error may escape this boundary.
     }
   }
 
@@ -167,6 +172,7 @@ class NativeGpuRenderBackend implements ArNativeTextureRenderBackend {
   }
 
   void _handleNativeReply(ByteData? response) {
+    if (_disposed) return;
     final rendered =
         response != null &&
         response.lengthInBytes > 0 &&

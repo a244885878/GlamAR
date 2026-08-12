@@ -302,7 +302,7 @@ class MakeupControlDock extends StatelessWidget {
   }
 
   String _detailLabel(MakeupPart part) => switch (part) {
-    MakeupPart.complexion => '立体',
+    MakeupPart.complexion => '磨皮',
     MakeupPart.blush => '位置',
     MakeupPart.eyeshadow => '闪度',
     MakeupPart.brows => '眉型',

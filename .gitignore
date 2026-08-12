@@ -33,6 +33,14 @@ migrate_working_dir/
 /build/
 /coverage/
 
+# Generated caches inside local/path dependencies
+**/.cxx/
+**/.gradle/
+**/.dart_tool/
+**/.swiftpm/
+**/DerivedData/
+**/Pods/
+
 # Symbolication related
 app.*.symbols
 

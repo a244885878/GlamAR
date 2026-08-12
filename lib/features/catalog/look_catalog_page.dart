@@ -53,10 +53,23 @@ class _LookCatalogPageState extends State<LookCatalogPage> {
                   icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 20),
                 ),
                 flexibleSpace: FlexibleSpaceBar(
-                  titlePadding: const EdgeInsets.fromLTRB(24, 0, 24, 18),
+                  // The pinned title shares the toolbar with the leading
+                  // button. Keep it outside the 56dp navigation affordance so
+                  // the collapsed state never paints over the back arrow.
+                  titlePadding: const EdgeInsets.fromLTRB(64, 0, 24, 18),
                   title: Text(
                     '${widget.category.title}精选',
-                    style: const TextStyle(fontWeight: FontWeight.w600),
+                    style: const TextStyle(
+                      color: GlamARColors.pearl,
+                      fontWeight: FontWeight.w700,
+                      shadows: [
+                        Shadow(
+                          color: Colors.black,
+                          blurRadius: 10,
+                          offset: Offset(0, 1),
+                        ),
+                      ],
+                    ),
                   ),
                   background: Stack(
                     fit: StackFit.expand,

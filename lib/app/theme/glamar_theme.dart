@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 /// GlamAR 视觉主题 — 暗色奢感 + 玫瑰金点缀。
 abstract final class GlamARColors {
@@ -25,14 +24,26 @@ abstract final class GlamARTheme {
       onSecondary: GlamARColors.ink,
     );
 
-    final displayFont = GoogleFonts.cormorantGaramondTextTheme();
-    final bodyFont = GoogleFonts.outfitTextTheme();
+    // All production data is local. System fonts avoid runtime downloads and
+    // keep Chinese title colors/metrics deterministic while offline.
+    const bodyFont = TextTheme();
+    const displayFont = TextTheme();
 
     return ThemeData(
       useMaterial3: true,
       brightness: Brightness.dark,
       colorScheme: scheme,
       scaffoldBackgroundColor: GlamARColors.ink,
+      snackBarTheme: const SnackBarThemeData(
+        backgroundColor: Color(0xF01B171C),
+        contentTextStyle: TextStyle(
+          color: GlamARColors.pearl,
+          fontSize: 13,
+          fontWeight: FontWeight.w600,
+        ),
+        actionTextColor: GlamARColors.rose,
+        behavior: SnackBarBehavior.floating,
+      ),
       textTheme: bodyFont
           .apply(
             bodyColor: GlamARColors.pearl,

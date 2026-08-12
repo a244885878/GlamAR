@@ -1,0 +1,38 @@
+#
+# To learn more about a Podspec see http://guides.cocoapods.org/syntax/podspec.html.
+# Run `pod lib lint mediapipe_face_mesh.podspec` to validate before publishing.
+#
+Pod::Spec.new do |s|
+  s.name             = 'mediapipe_face_mesh'
+  s.version          = '1.10.1'
+  s.summary          = 'MediaPipe Face Mesh for Flutter on Android and iOS.'
+  s.description      = <<-DESC
+Real-time face mesh detection for Flutter with bundled MediaPipe face mesh,
+face detector, and TensorFlow Lite runtime binaries for Android and iOS.
+                       DESC
+  s.homepage         = 'https://github.com/cornpip/mediapipe_face_mesh.git'
+  s.license          = { :file => '../LICENSE' }
+  s.author           = { 'mediapipe_face_mesh contributors' => 'cornpip7777@gmail.com' }
+
+  # This will ensure the source files in Classes/ are included in the native
+  # builds of apps using this FFI plugin. Podspec does not support relative
+  # paths, so Classes contains a forwarder C file that relatively imports
+  # `../src/*` so that the C sources can be shared among all target platforms.
+  s.source           = { :path => '.' }
+  # `.cc` files are pulled in via the ObjC++ forwarders in Classes/ to avoid
+  # double compilation; only headers are exposed here.
+  s.source_files = 'Classes/**/*', '../src/**/*.h'
+  s.dependency 'Flutter'
+  s.platform = :ios, '13.0'
+
+  # Flutter.framework does not contain a i386 slice.
+  s.pod_target_xcconfig = {
+    'DEFINES_MODULE' => 'YES',
+    'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
+    'HEADER_SEARCH_PATHS' => '"$(PODS_TARGET_SRCROOT)/../src/include" $(inherited)'
+  }
+  s.swift_version = '5.0'
+
+  # Bundle the TensorFlow Lite C runtime copied into ios/Frameworks.
+  s.vendored_frameworks = 'Frameworks/TensorFlowLiteC.framework'
+end

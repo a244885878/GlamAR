@@ -29,7 +29,10 @@ void main() {
 
   vec4 source = texture(u_texture, uv);
   vec3 center = source.rgb;
-  vec2 pixel = vec2(1.25) / u_size;
+  // 随底妆强度扩大低频采样半径，不增加纹理读取次数。9-tap
+  // 边缘感知核柔化色斑/粗糙感，五官边缘仍由 edge_weight 保护。
+  float sample_radius = mix(1.45, 2.55, clamp(u_strength * 2.2, 0.0, 1.0));
+  vec2 pixel = vec2(sample_radius) / u_size;
 
   vec3 accumulated = center * 1.8;
   float total_weight = 1.8;

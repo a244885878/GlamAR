@@ -219,7 +219,15 @@ class _CategoryCard extends StatelessWidget {
                       Text(
                         info.title,
                         style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                          color: GlamARColors.pearl,
                           fontWeight: FontWeight.w600,
+                          shadows: const [
+                            Shadow(
+                              color: Colors.black87,
+                              blurRadius: 8,
+                              offset: Offset(0, 1),
+                            ),
+                          ],
                         ),
                       ),
                       const Spacer(),

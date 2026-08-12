@@ -444,9 +444,11 @@ abstract final class MakeupLibrary {
       tags: tags,
       complexion: MakeupLayerConfig(
         color: skin,
-        intensity: soft ? 0.32 : 0.46,
-        detail: bold ? 0.72 : 0.48,
-        product: 'GlamAR · Adaptive Skin',
+        // 底妆先于所有彩妆渲染：中等默认值能够均匀肤色与柔化小瑕疵，
+        // 但保留毛孔、细纹和原有五官，不做几何变形。
+        intensity: soft ? 0.48 : (bold ? 0.64 : 0.58),
+        detail: soft ? 0.46 : (bold ? 0.62 : 0.54),
+        product: 'GlamAR · 清透无瑕底妆',
       ),
       blush: MakeupLayerConfig(
         color: blush,

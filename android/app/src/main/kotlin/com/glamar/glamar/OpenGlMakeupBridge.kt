@@ -265,6 +265,7 @@ private class GlamArOpenGlRenderer(
     private val thread = HandlerThread("GlamAR-OpenGL", Process.THREAD_PRIORITY_DISPLAY).apply { start() }
     private val handler = Handler(thread.looper)
     private var released = false
+    private var failed = false
     private var lastSubmissionSequence = 0L
     private var lastSourceSequence = 0L
     private val stabilizedLandmarks = FloatArray(468 * 3)
@@ -342,11 +343,23 @@ private class GlamArOpenGlRenderer(
         surfaceProducer.setSize(pixelWidth, pixelHeight)
         surfaceProducer.setCallback(object : TextureRegistry.SurfaceProducer.Callback {
             override fun onSurfaceDestroyed() {
-                handler.post { releaseEgl() }
+                handler.post {
+                    try {
+                        releaseEgl()
+                    } catch (_: Throwable) {
+                        failClosed()
+                    }
+                }
             }
 
             override fun onSurfaceCleanup() {
-                handler.post { releaseEgl() }
+                handler.post {
+                    try {
+                        releaseEgl()
+                    } catch (_: Throwable) {
+                        failClosed()
+                    }
+                }
             }
         })
     }
@@ -355,22 +368,69 @@ private class GlamArOpenGlRenderer(
         val copied = ByteBuffer.allocateDirect(data.remaining()).order(ByteOrder.LITTLE_ENDIAN)
         copied.put(data.duplicate()).flip()
         handler.post {
-            val frame = GlamArRenderFrame.decode(copied)
-            if (released || frame == null || frame.submissionSequence <= lastSubmissionSequence) {
+            if (released || failed) {
                 completion(false)
                 return@post
             }
-            lastSubmissionSequence = frame.submissionSequence
-            stabilizeResidualNoise(frame)
-            completion(draw(frame))
+            try {
+                val frame = GlamArRenderFrame.decode(copied)
+                if (frame == null || frame.submissionSequence <= lastSubmissionSequence) {
+                    completion(false)
+                    return@post
+                }
+                lastSubmissionSequence = frame.submissionSequence
+                stabilizeResidualNoise(frame)
+                completion(draw(frame))
+            } catch (_: Throwable) {
+                // Vendor EGL implementations may throw when CameraX replaces a
+                // surface during startup/lifecycle changes. Never let an
+                // exception on this display-priority thread terminate the app.
+                failClosed()
+                completion(false)
+            }
+        }
+    }
+
+    fun prepare(completion: (Boolean) -> Unit) {
+        handler.post {
+            if (released || failed) {
+                completion(false)
+                return@post
+            }
+            try {
+                // Do not advertise the texture until EGL, both programs and a
+                // first transparent swap have succeeded on this exact device.
+                completion(draw(null))
+            } catch (_: Throwable) {
+                failClosed()
+                completion(false)
+            }
         }
     }
 
     fun clear(completion: (Boolean) -> Unit) {
         handler.post {
-            hasStabilizedLandmarks = false
-            lastSourceSequence = 0L
-            completion(draw(null))
+            if (released || failed) {
+                completion(false)
+                return@post
+            }
+            try {
+                hasStabilizedLandmarks = false
+                lastSourceSequence = 0L
+                completion(draw(null))
+            } catch (_: Throwable) {
+                failClosed()
+                completion(false)
+            }
+        }
+    }
+
+    private fun failClosed() {
+        failed = true
+        try {
+            releaseEgl()
+        } catch (_: Throwable) {
+            // The Flutter compositor remains the authoritative fallback.
         }
     }
 
@@ -574,8 +634,12 @@ private class GlamArOpenGlRenderer(
         }
         EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, System.nanoTime())
         val swapped = EGL14.eglSwapBuffers(eglDisplay, eglSurface)
-        if (swapped) surfaceProducer.scheduleFrame()
         return swapped && GLES20.glGetError() == GLES20.GL_NO_ERROR
+    }
+
+    /** Must be called on Android's main thread. */
+    fun scheduleFlutterFrame() {
+        surfaceProducer.scheduleFrame()
     }
 
     private fun drawEyeshadow(frame: GlamArRenderFrame) {
@@ -1179,8 +1243,13 @@ private class GlamArOpenGlRenderer(
     fun release(onGlReleased: () -> Unit) {
         handler.post {
             released = true
-            releaseEgl()
-            onGlReleased()
+            try {
+                releaseEgl()
+            } catch (_: Throwable) {
+                // SurfaceProducer can already be detached during engine exit.
+            } finally {
+                onGlReleased()
+            }
             thread.quitSafely()
         }
     }
@@ -1256,6 +1325,9 @@ class OpenGlMakeupBridge(
             val startedAt = System.nanoTime()
             current.render(message) { rendered ->
                 mainHandler.post {
+                    if (rendered && renderer === current) {
+                        current.scheduleFlutterFrame()
+                    }
                     val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000f
                     val thermalLevel = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         powerManager.currentThermalStatus.coerceIn(0, 4)
@@ -1309,10 +1381,41 @@ class OpenGlMakeupBridge(
                     foundationIndices,
                 )
                 renderer = created
-                result.success(surfaceResult(created))
+                created.prepare { ready ->
+                    mainHandler.post {
+                        if (renderer !== created) {
+                            result.error(
+                                "renderer_disposed",
+                                "OpenGL renderer was disposed during initialization.",
+                                null,
+                            )
+                        } else if (ready) {
+                            created.scheduleFlutterFrame()
+                            result.success(surfaceResult(created))
+                        } else {
+                            renderer = null
+                            created.release {
+                                mainHandler.post { created.releaseTextureEntry() }
+                            }
+                            result.error(
+                                "opengl_unavailable",
+                                "OpenGL makeup surface failed its startup probe.",
+                                null,
+                            )
+                        }
+                    }
+                }
             }
             "clear" -> {
-                renderer?.clear { mainHandler.post { result.success(null) } }
+                val current = renderer
+                current?.clear { cleared ->
+                    mainHandler.post {
+                        if (cleared && renderer === current) {
+                            current.scheduleFlutterFrame()
+                        }
+                        result.success(null)
+                    }
+                }
                     ?: result.success(null)
             }
             "dispose" -> {
