@@ -71,6 +71,8 @@ flutter:
   shaders:
     - shaders/skin_makeup_filter.frag
     - shaders/lip_material_filter.frag
+    - shaders/color_makeup_filter.frag
+    - shaders/face_color_material_filter.frag
 
   # To add assets to your application, add an assets section, like this:
   # assets:

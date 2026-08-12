@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
@@ -18,6 +19,10 @@ import 'package:glamar/features/makeup/models/face_render_context.dart';
 import 'package:glamar/features/makeup/models/makeup_look.dart';
 import 'package:glamar/features/makeup/painters/makeup_renderer.dart';
 import 'package:glamar/features/makeup/painters/makeup_painter_utils.dart';
+import 'package:glamar/features/makeup/rendering/ar_render_backend.dart';
+import 'package:glamar/features/makeup/rendering/ar_render_packet.dart';
+import 'package:glamar/features/makeup/rendering/flutter_composite_render_backend.dart';
+import 'package:glamar/features/makeup/rendering/native_gpu_render_backend.dart';
 import 'package:glamar/features/makeup/shaders/makeup_shader_programs.dart';
 import 'package:glamar/features/makeup/widgets/makeup_control_dock.dart';
 import 'package:mediapipe_face_mesh/mediapipe_face_mesh.dart';
@@ -57,17 +62,19 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   String _statusMessage = '正在启动相机...';
   Size _paintSize = Size.zero;
 
-  final ValueNotifier<NormalizedFaceFrame?> _trackedFaceFrame =
-      ValueNotifier<NormalizedFaceFrame?>(null);
   final ValueNotifier<_TrackingPerformance> _trackingPerformance =
       ValueNotifier<_TrackingPerformance>(const _TrackingPerformance());
   final ValueNotifier<_OcclusionTexture?> _occlusionTexture =
       ValueNotifier<_OcclusionTexture?>(null);
   final AdaptiveLandmarkSmoother _landmarkSmoother = AdaptiveLandmarkSmoother();
   final ArFrameTimeline _frameTimeline = ArFrameTimeline();
+  late final ArRenderBackend _renderBackend;
   late final Ticker _renderTicker;
   late MakeupLook _activeLook;
   late MakeupLook _presetLook;
+  late ArMakeupMaterialState _materialState;
+  final ArFaceRenderStateCache _faceRenderStateCache = ArFaceRenderStateCache();
+  int _renderSubmissionSequence = 0;
   MakeupPart _selectedPart = MakeupPart.lips;
   bool _panelExpanded = false;
   bool _makeupVisible = true;
@@ -82,9 +89,11 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   int _consecutiveInferenceErrors = 0;
   int _consecutiveOcclusionErrors = 0;
   double _occlusionInferenceMsEma = 0;
+  double _rasterFrameMsEma = 0;
   double _makeupTrackingOpacity = 1;
   double _runtimeRenderQuality = 1;
   bool _gpuSkinFilterEnabled = true;
+  bool _pixelMaterialsEnabled = true;
   DateTime _nextOcclusionAllowedAt = DateTime.fromMillisecondsSinceEpoch(0);
   FaceLighting _faceLighting = FaceLighting.neutral;
   FaceRenderContext _renderContext = const FaceRenderContext.neutral();
@@ -94,7 +103,14 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     super.initState();
     _activeLook = widget.initialLook;
     _presetLook = widget.initialLook;
+    _materialState = ArMakeupMaterialState.fromLook(_activeLook);
+    _renderBackend = Platform.isIOS
+        ? NativeGpuRenderBackend.iosMetal()
+        : Platform.isAndroid
+        ? NativeGpuRenderBackend.androidOpenGl()
+        : FlutterCompositeRenderBackend();
     WidgetsBinding.instance.addObserver(this);
+    SchedulerBinding.instance.addTimingsCallback(_onFrameTimings);
     _renderTicker = createTicker(_onRenderTick)..start();
     unawaited(MakeupShaderPrograms.warmUp().catchError((_) {}));
     _bootstrap();
@@ -274,7 +290,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       displayTimestamp: _frameTimeline.renderTimestamp,
       maximumPrediction: _frameTimeline.maximumPredictionHorizon,
     );
-    _trackedFaceFrame.value = frame;
+    if (frame != null) _submitRenderFrame(frame);
   }
 
   void _onRenderTick(Duration _) {
@@ -295,7 +311,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       displayTimestamp: renderTimestamp,
       maximumPrediction: _frameTimeline.maximumPredictionHorizon,
     );
-    if (predicted != null) _trackedFaceFrame.value = predicted;
+    if (predicted != null) _submitRenderFrame(predicted);
   }
 
   void _updateTrackingBridge(Duration now) {
@@ -314,7 +330,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       displayTimestamp: _frameTimeline.renderTimestamp,
       maximumPrediction: _frameTimeline.maximumPredictionHorizon,
     );
-    if (predicted != null) _trackedFaceFrame.value = predicted;
+    if (predicted != null) _submitRenderFrame(predicted);
   }
 
   void _expireTrackingBridge() {
@@ -323,9 +339,34 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     _lastValidMeshTimestamp = null;
     _landmarkCount = 0;
     _landmarkSmoother.reset();
-    if (_trackedFaceFrame.value != null) _trackedFaceFrame.value = null;
+    _renderBackend.clear();
     _clearOcclusionTexture();
     if (hadFace && mounted) setState(() {});
+  }
+
+  void _submitRenderFrame(NormalizedFaceFrame frame) {
+    _renderBackend.submit(
+      ArRenderPacket(
+        submissionSequence: ++_renderSubmissionSequence,
+        faceFrame: frame,
+        material: _materialState,
+        faceState: _faceRenderStateCache.resolve(
+          context: _renderContext,
+          trackingOpacity: _makeupTrackingOpacity,
+          runtimeDetailQuality: _runtimeRenderQuality,
+          skinFilterEnabled: _gpuSkinFilterEnabled,
+          pixelMaterialEnabled:
+              ui.ImageFilter.isShaderFilterSupported && _pixelMaterialsEnabled,
+        ),
+        mirrorHorizontal: _mirrorHorizontal,
+      ),
+    );
+  }
+
+  void _refreshMaterialAndRender() {
+    _materialState = ArMakeupMaterialState.fromLook(_activeLook);
+    final frame = _renderBackend.frames.value?.faceFrame;
+    if (frame != null) _submitRenderFrame(frame);
   }
 
   void _recordPerformance(Duration duration, bool trackedFace) {
@@ -346,17 +387,35 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       fps: fps,
       inferenceMs: _inferenceMsEma,
       pipelineLatencyMs: _frameTimeline.pipelineLatencyMs,
+      nativeGpuMs: _nativeRenderBackend?.nativeRenderMs.value ?? 0,
+      rasterFrameMs: _rasterFrameMsEma,
+      thermalPressure: _nativeRenderBackend?.thermalPressure.value ?? 0,
       tracking: trackedFace,
     );
-    _updateRuntimeRenderQuality(fps, _inferenceMsEma);
+    _updateRuntimeRenderQuality(
+      fps,
+      _inferenceMsEma,
+      _nativeRenderBackend?.nativeRenderMs.value ?? 0,
+      _rasterFrameMsEma,
+      _nativeRenderBackend?.thermalPressure.value ?? 0,
+    );
     _performanceWindowStartedAt = now;
     _performanceFrameCount = 0;
   }
 
-  void _updateRuntimeRenderQuality(double fps, double inferenceMs) {
+  void _updateRuntimeRenderQuality(
+    double fps,
+    double inferenceMs,
+    double nativeGpuMs,
+    double rasterFrameMs,
+    double thermalPressure,
+  ) {
     final target = ArRuntimeGovernor.renderDetailQuality(
       faceFps: fps,
       faceInferenceMs: inferenceMs,
+      gpuRenderMs: nativeGpuMs,
+      rasterFrameMs: rasterFrameMs,
+      thermalPressure: thermalPressure,
     );
     final response = target < _runtimeRenderQuality ? 0.55 : 0.16;
     _runtimeRenderQuality += (target - _runtimeRenderQuality) * response;
@@ -365,6 +424,22 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       _gpuSkinFilterEnabled = false;
     } else if (!_gpuSkinFilterEnabled && _runtimeRenderQuality > 0.74) {
       _gpuSkinFilterEnabled = true;
+    }
+    // 像素材质会改变原生底色的混合权重，必须用滞回避免临界负载下
+    // 两条链路频繁切换产生肉眼可见的明暗闪烁。
+    if (_pixelMaterialsEnabled && _runtimeRenderQuality < 0.7) {
+      _pixelMaterialsEnabled = false;
+    } else if (!_pixelMaterialsEnabled && _runtimeRenderQuality > 0.84) {
+      _pixelMaterialsEnabled = true;
+    }
+  }
+
+  void _onFrameTimings(List<FrameTiming> timings) {
+    for (final timing in timings) {
+      final currentMs = timing.rasterDuration.inMicroseconds / 1000;
+      _rasterFrameMsEma = _rasterFrameMsEma == 0
+          ? currentMs
+          : _rasterFrameMsEma * 0.88 + currentMs * 0.12;
     }
   }
 
@@ -495,6 +570,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
           faceFps: performance.fps,
           faceInferenceMs: performance.inferenceMs,
           occlusionInferenceMs: _occlusionInferenceMsEma,
+          thermalPressure: _nativeRenderBackend?.thermalPressure.value ?? 0,
         ),
       );
     }
@@ -594,11 +670,14 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     _consecutiveInferenceErrors = 0;
     _consecutiveOcclusionErrors = 0;
     _occlusionInferenceMsEma = 0;
+    _rasterFrameMsEma = 0;
     _makeupTrackingOpacity = 1;
     _runtimeRenderQuality = 1;
     _gpuSkinFilterEnabled = true;
+    _pixelMaterialsEnabled = true;
     _faceLighting = FaceLighting.neutral;
     _renderContext = const FaceRenderContext.neutral();
+    _faceRenderStateCache.clear();
   }
 
   @override
@@ -624,7 +703,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       _makeupTrackingOpacity = 0;
       _frameTimeline.reset();
       _landmarkSmoother.reset();
-      _trackedFaceFrame.value = null;
+      _renderBackend.clear();
     } else if (state == AppLifecycleState.resumed &&
         _cameraController == null) {
       setState(() {
@@ -638,6 +717,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    SchedulerBinding.instance.removeTimingsCallback(_onFrameTimings);
     _renderTicker.dispose();
     _stopInferenceStream();
     _cameraController?.dispose();
@@ -646,7 +726,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     unawaited(_occlusionWorker?.close());
     _occlusionWorker = null;
     _clearOcclusionTexture();
-    _trackedFaceFrame.dispose();
+    _renderBackend.dispose();
     _trackingPerformance.dispose();
     _occlusionTexture.dispose();
     super.dispose();
@@ -656,6 +736,11 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     final controller = _cameraController;
     return !Platform.isIOS &&
         controller?.description.lensDirection == CameraLensDirection.front;
+  }
+
+  ArNativeTextureRenderBackend? get _nativeRenderBackend {
+    final backend = _renderBackend;
+    return backend is ArNativeTextureRenderBackend ? backend : null;
   }
 
   void _drawPhotoSource(
@@ -717,8 +802,26 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     }
   }
 
-  void _erasePhotoOcclusion(
+  Future<ui.Codec> _decodePhotoCodec(Uint8List bytes) async {
+    final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
+    final descriptor = await ui.ImageDescriptor.encoded(buffer);
+    const maximumCompositionSide = 2560;
+    final longestSide = math.max(descriptor.width, descriptor.height);
+    final scale = longestSide > maximumCompositionSide
+        ? maximumCompositionSide / longestSide
+        : 1.0;
+    final codec = await descriptor.instantiateCodec(
+      targetWidth: math.max(1, (descriptor.width * scale).round()),
+      targetHeight: math.max(1, (descriptor.height * scale).round()),
+    );
+    descriptor.dispose();
+    buffer.dispose();
+    return codec;
+  }
+
+  void _restorePhotoOcclusion(
     Canvas canvas,
+    ui.Image source,
     ui.Image mask,
     FaceOcclusionRoi roi,
     Size targetSize, {
@@ -730,7 +833,14 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       roi.width * targetSize.width,
       roi.height * targetSize.height,
     );
-    canvas.save();
+    canvas.saveLayer(Offset.zero & targetSize, Paint());
+    _drawPhotoSource(
+      canvas,
+      source,
+      targetSize,
+      mirrored: mirrored,
+      paint: Paint()..filterQuality = FilterQuality.high,
+    );
     if (mirrored) {
       canvas.translate(targetSize.width, 0);
       canvas.scale(-1, 1);
@@ -740,7 +850,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       Rect.fromLTWH(0, 0, mask.width.toDouble(), mask.height.toDouble()),
       target,
       Paint()
-        ..blendMode = BlendMode.dstOut
+        ..blendMode = BlendMode.dstIn
         ..filterQuality = FilterQuality.high,
     );
     canvas.restore();
@@ -757,6 +867,12 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       return;
     }
 
+    ui.Codec? photoCodec;
+    ui.Image? photoSource;
+    ui.Image? photoOcclusionImage;
+    ui.Image? stagedComposite;
+    ui.Image? renderedPhoto;
+    final photoShaders = <ui.FragmentShader>[];
     setState(() => _isCapturing = true);
     try {
       _stopInferenceStream();
@@ -765,9 +881,9 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       }
       final file = await controller.takePicture();
       final sourceBytes = await file.readAsBytes();
-      final codec = await ui.instantiateImageCodec(sourceBytes);
-      final frame = await codec.getNextFrame();
-      final source = frame.image;
+      photoCodec = await _decodePhotoCodec(sourceBytes);
+      final frame = await photoCodec.getNextFrame();
+      final source = photoSource = frame.image;
       final targetSize = Size(
         source.width.toDouble(),
         source.height.toDouble(),
@@ -776,13 +892,12 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       final photoOcclusion = _makeupVisible
           ? await _inferPhotoOcclusion(source, mesh)
           : null;
-      final photoOcclusionImage = photoOcclusion == null
+      photoOcclusionImage = photoOcclusion == null
           ? null
           : await _decodeOcclusionImage(photoOcclusion.rgba);
 
-      final recorder = ui.PictureRecorder();
-      final canvas = Canvas(recorder);
-      final photoShaders = <ui.FragmentShader>[];
+      var recorder = ui.PictureRecorder();
+      var canvas = Canvas(recorder);
       _drawPhotoSource(
         canvas,
         source,
@@ -792,9 +907,36 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
       );
 
       if (_makeupVisible) {
-        if (photoOcclusionImage != null) {
-          canvas.saveLayer(Offset.zero & targetSize, Paint());
+        Future<void> flattenPhotoStage() async {
+          final stagePicture = recorder.endRecording();
+          final next = await stagePicture.toImage(source.width, source.height);
+          stagePicture.dispose();
+          stagedComposite?.dispose();
+          stagedComposite = next;
+          recorder = ui.PictureRecorder();
+          canvas = Canvas(recorder)
+            ..drawImage(
+              next,
+              Offset.zero,
+              Paint()..filterQuality = FilterQuality.high,
+            );
         }
+
+        void drawPhotoStageSource(Paint paint) {
+          final staged = stagedComposite;
+          if (staged != null) {
+            canvas.drawImage(staged, Offset.zero, paint);
+          } else {
+            _drawPhotoSource(
+              canvas,
+              source,
+              targetSize,
+              mirrored: mirrorPhoto,
+              paint: paint,
+            );
+          }
+        }
+
         final photoLandmarks = List<Offset>.generate(mesh.landmarks.length, (
           index,
         ) {
@@ -809,6 +951,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
           mesh,
           _faceLighting,
         );
+        final pixelRenderedParts = <MakeupPart>{};
         if (_activeLook.complexion.enabled) {
           final faceWidth = MakeupPainterUtils.faceWidth(photoLandmarks);
           final skinPath = MakeupPainterUtils.skinPath(
@@ -853,14 +996,68 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
           );
           canvas.save();
           canvas.clipPath(skinPath);
-          _drawPhotoSource(
-            canvas,
-            source,
-            targetSize,
-            mirrored: mirrorPhoto,
-            paint: skinPaint,
-          );
+          drawPhotoStageSource(skinPaint);
           canvas.restore();
+          await flattenPhotoStage();
+        }
+        if (ui.ImageFilter.isShaderFilterSupported) {
+          for (final part in <MakeupPart>[
+            MakeupPart.blush,
+            MakeupPart.eyeshadow,
+          ]) {
+            final config = _activeLook.layer(part);
+            if (!config.enabled) continue;
+            try {
+              final shader = (await MakeupShaderPrograms.colorMaterial())
+                  .fragmentShader();
+              final primary = photoRenderContext.adaptColor(config.color);
+              final secondary = photoRenderContext.adaptColor(
+                config.secondaryColor ?? config.color,
+              );
+              shader
+                ..setFloat(2, primary.r)
+                ..setFloat(3, primary.g)
+                ..setFloat(4, primary.b)
+                ..setFloat(5, secondary.r)
+                ..setFloat(6, secondary.g)
+                ..setFloat(7, secondary.b)
+                ..setFloat(
+                  8,
+                  config.intensity *
+                      photoRenderContext.profileOpacity *
+                      (part == MakeupPart.blush ? 0.21 : 0.28),
+                )
+                ..setFloat(9, part == MakeupPart.eyeshadow ? 1 : 0)
+                ..setFloat(10, config.detail);
+              _setColorMaterialShapeUniforms(
+                shader,
+                landmarks: photoLandmarks,
+                config: config,
+                renderContext: photoRenderContext,
+                part: part,
+                size: targetSize,
+              );
+              final materialPath = _ColorMaterialClipper(
+                landmarks: photoLandmarks,
+                config: config,
+                renderContext: photoRenderContext,
+                part: part,
+              ).getClip(targetSize);
+              canvas.save();
+              canvas.clipPath(materialPath);
+              drawPhotoStageSource(
+                Paint()
+                  ..filterQuality = FilterQuality.high
+                  ..imageFilter = ui.ImageFilter.shader(shader),
+              );
+              canvas.restore();
+              await flattenPhotoStage();
+              photoShaders.add(shader);
+              pixelRenderedParts.add(part);
+            } catch (_) {
+              // 对应 Canvas Painter 会在下方补齐该部位。
+            }
+          }
         }
         if (_activeLook.lips.enabled &&
             ui.ImageFilter.isShaderFilterSupported) {
@@ -881,20 +1078,20 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                 LipFinish.velvet => 0,
                 LipFinish.satin => 0.48,
                 LipFinish.glass => 1,
-              });
+              })
+              ..setFloat(7, config.detail)
+              ..setFloat(8, photoRenderContext.mouthOpenness);
             canvas.save();
             canvas.clipPath(MakeupPainterUtils.lipPath(photoLandmarks));
-            _drawPhotoSource(
-              canvas,
-              source,
-              targetSize,
-              mirrored: mirrorPhoto,
-              paint: Paint()
+            drawPhotoStageSource(
+              Paint()
                 ..filterQuality = FilterQuality.high
                 ..imageFilter = ui.ImageFilter.shader(lipShader),
             );
             canvas.restore();
+            await flattenPhotoStage();
             photoShaders.add(lipShader);
+            pixelRenderedParts.add(MakeupPart.lips);
           } catch (_) {
             // Canvas 唇妆仍会完整绘制。
           }
@@ -905,25 +1102,27 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
           photoLandmarks,
           _activeLook,
           renderContext: photoRenderContext,
+          excludedParts: pixelRenderedParts,
         );
         if (photoOcclusionImage != null && photoOcclusion != null) {
-          _erasePhotoOcclusion(
+          _restorePhotoOcclusion(
             canvas,
+            source,
             photoOcclusionImage,
             photoOcclusion.roi,
             targetSize,
             mirrored: mirrorPhoto,
           );
-          canvas.restore();
         }
       }
 
       final picture = recorder.endRecording();
-      final rendered = await picture.toImage(source.width, source.height);
-      for (final shader in photoShaders) {
-        shader.dispose();
+      try {
+        renderedPhoto = await picture.toImage(source.width, source.height);
+      } finally {
+        picture.dispose();
       }
-      final byteData = await rendered.toByteData(
+      final byteData = await renderedPhoto.toByteData(
         format: ui.ImageByteFormat.png,
       );
       if (byteData == null) throw StateError('照片编码失败');
@@ -935,10 +1134,6 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
         album: 'GlamAR',
         name: 'GlamAR_${DateTime.now().millisecondsSinceEpoch}',
       );
-      codec.dispose();
-      source.dispose();
-      photoOcclusionImage?.dispose();
-      rendered.dispose();
       if (mounted) {
         setState(() => _showCaptureFlash = true);
         await Future<void>.delayed(const Duration(milliseconds: 100));
@@ -952,6 +1147,14 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
     } catch (error) {
       _showMessage('拍照失败：$error');
     } finally {
+      for (final shader in photoShaders) {
+        shader.dispose();
+      }
+      stagedComposite?.dispose();
+      photoOcclusionImage?.dispose();
+      renderedPhoto?.dispose();
+      photoSource?.dispose();
+      photoCodec?.dispose();
       if (mounted &&
           _cameraController == controller &&
           controller.value.isInitialized) {
@@ -980,6 +1183,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
 
   void _updateLayer(MakeupLayerConfig layer) {
     setState(() => _activeLook = _activeLook.withLayer(_selectedPart, layer));
+    _refreshMaterialAndRender();
   }
 
   void _resetSelectedPart() {
@@ -992,6 +1196,7 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
         _activeLook = _activeLook.withLipFinish(_presetLook.lipFinish);
       }
     });
+    _refreshMaterialAndRender();
   }
 
   @override
@@ -1053,40 +1258,79 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                             if (_makeupVisible)
                               RepaintBoundary(
                                 child: ListenableBuilder(
-                                  listenable: _trackedFaceFrame,
+                                  listenable: Listenable.merge(<Listenable>[
+                                    _renderBackend.frames,
+                                    if (_renderBackend
+                                        case final ArNativeTextureRenderBackend
+                                            nativeBackend)
+                                      nativeBackend.nativeSurface,
+                                  ]),
                                   builder: (context, _) {
-                                    final frame = _trackedFaceFrame.value;
-                                    if (frame == null) {
+                                    final packet = _renderBackend.frames.value;
+                                    if (packet == null) {
                                       return const SizedBox.shrink();
                                     }
-                                    final pixels = frame.projectToPixels(
-                                      paintSize,
-                                      mirrorHorizontal: _mirrorHorizontal,
-                                    );
+                                    final nativeBackend = _nativeRenderBackend;
+                                    final nativeSurface =
+                                        nativeBackend?.nativeSurface.value;
+                                    final nativeParts = nativeSurface == null
+                                        ? const <MakeupPart>{}
+                                        : nativeBackend!.nativeParts;
+                                    final pixels = packet.faceFrame
+                                        .projectToPixels(
+                                          paintSize,
+                                          mirrorHorizontal:
+                                              packet.mirrorHorizontal,
+                                        );
+                                    final look = packet.material.look;
+                                    final faceState = packet.faceState;
+                                    final renderContext = faceState.context;
                                     final makeup = Stack(
                                       fit: StackFit.expand,
                                       children: [
-                                        if (_activeLook.complexion.enabled &&
-                                            _gpuSkinFilterEnabled)
+                                        if (look.complexion.enabled &&
+                                            faceState.skinFilterEnabled)
                                           _SkinSmoothingLayer(
                                             landmarks: pixels,
-                                            config: _activeLook.complexion,
-                                            renderContext: _renderContext,
-                                          ),
-                                        if (_activeLook.lips.enabled)
-                                          _LipMaterialLayer(
-                                            landmarks: pixels,
-                                            config: _activeLook.lips,
-                                            finish: _activeLook.lipFinish,
-                                            renderContext: _renderContext,
+                                            config: look.complexion,
+                                            renderContext: renderContext,
                                           ),
                                         CustomPaint(
                                           painter: _FullMakeupPainter(
                                             landmarks: pixels,
-                                            look: _activeLook,
-                                            renderContext: _renderContext,
+                                            look: look,
+                                            renderContext: renderContext,
+                                            excludedParts: nativeParts,
                                           ),
                                         ),
+                                        if (nativeSurface != null)
+                                          IgnorePointer(
+                                            child: Texture(
+                                              textureId:
+                                                  nativeSurface.textureId,
+                                              filterQuality:
+                                                  FilterQuality.medium,
+                                            ),
+                                          ),
+                                        if ((look.blush.enabled ||
+                                                look.eyeshadow.enabled) &&
+                                            faceState.pixelMaterialEnabled &&
+                                            nativeSurface != null)
+                                          _FaceColorMaterialLayer(
+                                            landmarks: pixels,
+                                            blush: look.blush,
+                                            eyeshadow: look.eyeshadow,
+                                            renderContext: renderContext,
+                                          ),
+                                        if (look.lips.enabled &&
+                                            faceState.pixelMaterialEnabled &&
+                                            nativeSurface != null)
+                                          _LipMaterialLayer(
+                                            landmarks: pixels,
+                                            config: look.lips,
+                                            finish: look.lipFinish,
+                                            renderContext: renderContext,
+                                          ),
                                       ],
                                     );
                                     return ValueListenableBuilder<
@@ -1099,15 +1343,17 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                                         if (texture != null) {
                                           rendered = _OcclusionMaskedMakeup(
                                             texture: texture,
-                                            mirrorHorizontal: _mirrorHorizontal,
+                                            mirrorHorizontal:
+                                                packet.mirrorHorizontal,
                                             child: rendered,
                                           );
                                         }
-                                        if (_makeupTrackingOpacity >= 0.999) {
+                                        if (faceState.trackingOpacity >=
+                                            0.999) {
                                           return rendered;
                                         }
                                         return Opacity(
-                                          opacity: _makeupTrackingOpacity,
+                                          opacity: faceState.trackingOpacity,
                                           child: rendered,
                                         );
                                       },
@@ -1152,8 +1398,10 @@ class _FaceMeshCameraPageState extends State<FaceMeshCameraPage>
                 setState(() => _panelExpanded = !_panelExpanded),
             onSelectPart: (part) => setState(() => _selectedPart = part),
             onLayerChanged: _updateLayer,
-            onLipFinishChanged: (finish) =>
-                setState(() => _activeLook = _activeLook.withLipFinish(finish)),
+            onLipFinishChanged: (finish) {
+              setState(() => _activeLook = _activeLook.withLipFinish(finish));
+              _refreshMaterialAndRender();
+            },
             onResetPart: _resetSelectedPart,
             onToggleMakeup: () =>
                 setState(() => _makeupVisible = !_makeupVisible),
@@ -1255,7 +1503,7 @@ class _PerformanceBadge extends StatelessWidget {
               const SizedBox(width: 6),
               Text(
                 ready
-                    ? 'AR ${performance.fps.round()} FPS  ·  E2E ${performance.pipelineLatencyMs.round()} ms'
+                    ? 'AR ${performance.fps.round()} FPS  ·  E2E ${performance.pipelineLatencyMs.round()} ms  ·  GPU ${performance.nativeGpuMs.toStringAsFixed(1)}  ·  R ${performance.rasterFrameMs.toStringAsFixed(1)} ms${performance.thermalPressure > 0.5 ? '  ·  温控' : ''}'
                     : 'AR -- FPS',
                 style: TextStyle(
                   color: Colors.white.withValues(alpha: 0.82),
@@ -1394,11 +1642,13 @@ class _FullMakeupPainter extends CustomPainter {
     required this.landmarks,
     required this.look,
     required this.renderContext,
+    this.excludedParts = const <MakeupPart>{},
   });
 
   final List<Offset> landmarks;
   final MakeupLook look;
   final FaceRenderContext renderContext;
+  final Set<MakeupPart> excludedParts;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -1408,6 +1658,7 @@ class _FullMakeupPainter extends CustomPainter {
       landmarks,
       look,
       renderContext: renderContext,
+      excludedParts: excludedParts,
     );
   }
 
@@ -1415,7 +1666,8 @@ class _FullMakeupPainter extends CustomPainter {
   bool shouldRepaint(_FullMakeupPainter oldDelegate) =>
       oldDelegate.landmarks != landmarks ||
       oldDelegate.look != look ||
-      oldDelegate.renderContext != renderContext;
+      oldDelegate.renderContext != renderContext ||
+      oldDelegate.excludedParts != excludedParts;
 }
 
 class _OcclusionMaskedMakeup extends StatelessWidget {
@@ -1560,6 +1812,398 @@ class _SkinSmoothingLayerState extends State<_SkinSmoothingLayer> {
 double _skinSmoothingSigma(MakeupLayerConfig config) =>
     0.18 + config.intensity * (0.34 + config.detail * 0.22);
 
+typedef _ColorMaterialShapes = ({Rect first, Rect second, double angle});
+
+_ColorMaterialShapes _colorMaterialShapes({
+  required List<Offset> landmarks,
+  required MakeupLayerConfig config,
+  required FaceRenderContext renderContext,
+  required MakeupPart part,
+}) {
+  final faceAngle = math.atan2(
+    landmarks[263].dy - landmarks[33].dy,
+    landmarks[263].dx - landmarks[33].dx,
+  );
+  if (part == MakeupPart.blush) {
+    final shapes = <Rect>[];
+    final faceCenter = landmarks[1];
+    for (final (anchor, edge, high) in <(int, int, int)>[
+      (117, 234, 50),
+      (346, 454, 280),
+    ]) {
+      final raw = landmarks[anchor];
+      final center = Offset.lerp(
+        raw,
+        landmarks[high],
+        0.12 + config.detail * 0.2,
+      )!;
+      final pulled = Offset.lerp(center, faceCenter, 0.05)!;
+      final span = math.max((raw - landmarks[edge]).distance, 1.0);
+      shapes.add(
+        Rect.fromCenter(
+          center: pulled,
+          width: span * (1.35 + config.detail * 0.34),
+          height: span * (0.84 + (1 - config.detail) * 0.26),
+        ),
+      );
+    }
+    return (first: shapes.first, second: shapes.last, angle: faceAngle);
+  }
+
+  final shapes = <Rect>[];
+  for (final (indices, sideA) in <(List<int>, bool)>[
+    (MakeupPainterUtils.leftEyeUpper, true),
+    (MakeupPainterUtils.rightEyeUpper, false),
+  ]) {
+    final points = indices.map((index) => landmarks[index]).toList();
+    final axis = points.last - points.first;
+    final axisLength = math.max(axis.distance, 1.0);
+    var normal = Offset(-axis.dy, axis.dx) / axisLength;
+    if (normal.dy > 0) normal = -normal;
+    final center = points.reduce((a, b) => a + b) / points.length.toDouble();
+    final blinkStability =
+        0.62 + renderContext.eyeOpennessForSide(sideA: sideA) * 0.38;
+    final lift = axisLength * (0.2 + config.detail * 0.14) * blinkStability;
+    shapes.add(
+      Rect.fromCenter(
+        center: center + normal * lift * 0.48,
+        width: axisLength * 1.08,
+        height: math.max(lift * 1.35, 1.0),
+      ),
+    );
+  }
+  return (first: shapes.first, second: shapes.last, angle: faceAngle);
+}
+
+void _setColorMaterialShapeUniforms(
+  ui.FragmentShader shader, {
+  required List<Offset> landmarks,
+  required MakeupLayerConfig config,
+  required FaceRenderContext renderContext,
+  required MakeupPart part,
+  required Size size,
+}) {
+  if (!MakeupPainterUtils.valid(landmarks) || size.isEmpty) return;
+  final shapes = _colorMaterialShapes(
+    landmarks: landmarks,
+    config: config,
+    renderContext: renderContext,
+    part: part,
+  );
+  void writeShape(int offset, Rect rect) {
+    shader
+      ..setFloat(offset, rect.center.dx / size.width)
+      ..setFloat(offset + 1, rect.center.dy / size.height)
+      ..setFloat(offset + 2, rect.width * 0.5 / size.width)
+      ..setFloat(offset + 3, rect.height * 0.5 / size.height);
+  }
+
+  writeShape(11, shapes.first);
+  writeShape(15, shapes.second);
+  shader
+    ..setFloat(19, math.cos(-shapes.angle))
+    ..setFloat(20, math.sin(-shapes.angle))
+    ..setFloat(
+      21,
+      part == MakeupPart.eyeshadow
+          ? renderContext.detailOpacityForSide(sideA: true)
+          : renderContext.opacityForSide(sideA: true),
+    )
+    ..setFloat(
+      22,
+      part == MakeupPart.eyeshadow
+          ? renderContext.detailOpacityForSide(sideA: false)
+          : renderContext.opacityForSide(sideA: false),
+    );
+}
+
+class _FaceColorMaterialLayer extends StatefulWidget {
+  const _FaceColorMaterialLayer({
+    required this.landmarks,
+    required this.blush,
+    required this.eyeshadow,
+    required this.renderContext,
+  });
+
+  final List<Offset> landmarks;
+  final MakeupLayerConfig blush;
+  final MakeupLayerConfig eyeshadow;
+  final FaceRenderContext renderContext;
+
+  @override
+  State<_FaceColorMaterialLayer> createState() =>
+      _FaceColorMaterialLayerState();
+}
+
+class _FaceColorMaterialLayerState extends State<_FaceColorMaterialLayer> {
+  ui.FragmentShader? _shader;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadShader();
+  }
+
+  Future<void> _loadShader() async {
+    if (!ui.ImageFilter.isShaderFilterSupported) return;
+    try {
+      final program = await MakeupShaderPrograms.faceColorMaterial();
+      if (!mounted) return;
+      _shader = program.fragmentShader();
+      _updateMaterialUniforms();
+      setState(() {});
+    } catch (_) {
+      // 原生 GPU 底色会继续显示，组合材质不可用时保持稳定回退。
+    }
+  }
+
+  @override
+  void didUpdateWidget(_FaceColorMaterialLayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.blush != widget.blush ||
+        oldWidget.eyeshadow != widget.eyeshadow ||
+        oldWidget.renderContext != widget.renderContext) {
+      _updateMaterialUniforms();
+    }
+  }
+
+  void _updateMaterialUniforms() {
+    final shader = _shader;
+    if (shader == null) return;
+    final blushPrimary = widget.renderContext.adaptColor(widget.blush.color);
+    final blushSecondary = widget.renderContext.adaptColor(
+      widget.blush.secondaryColor ?? widget.blush.color,
+    );
+    final eyePrimary = widget.renderContext.adaptColor(widget.eyeshadow.color);
+    final eyeSecondary = widget.renderContext.adaptColor(
+      widget.eyeshadow.secondaryColor ?? widget.eyeshadow.color,
+    );
+    shader
+      ..setFloat(2, blushPrimary.r)
+      ..setFloat(3, blushPrimary.g)
+      ..setFloat(4, blushPrimary.b)
+      ..setFloat(5, blushSecondary.r)
+      ..setFloat(6, blushSecondary.g)
+      ..setFloat(7, blushSecondary.b)
+      ..setFloat(
+        8,
+        widget.blush.enabled
+            ? widget.blush.intensity *
+                  widget.renderContext.profileOpacity *
+                  0.21
+            : 0,
+      )
+      ..setFloat(9, widget.blush.detail)
+      ..setFloat(20, widget.renderContext.opacityForSide(sideA: true))
+      ..setFloat(21, widget.renderContext.opacityForSide(sideA: false))
+      ..setFloat(22, eyePrimary.r)
+      ..setFloat(23, eyePrimary.g)
+      ..setFloat(24, eyePrimary.b)
+      ..setFloat(25, eyeSecondary.r)
+      ..setFloat(26, eyeSecondary.g)
+      ..setFloat(27, eyeSecondary.b)
+      ..setFloat(
+        28,
+        widget.eyeshadow.enabled
+            ? widget.eyeshadow.intensity *
+                  widget.renderContext.profileOpacity *
+                  0.28
+            : 0,
+      )
+      ..setFloat(29, widget.eyeshadow.detail)
+      ..setFloat(38, widget.renderContext.detailOpacityForSide(sideA: true))
+      ..setFloat(39, widget.renderContext.detailOpacityForSide(sideA: false));
+  }
+
+  void _writeShape(int offset, Rect rect, Size size) {
+    _shader!
+      ..setFloat(offset, rect.center.dx / size.width)
+      ..setFloat(offset + 1, rect.center.dy / size.height)
+      ..setFloat(offset + 2, rect.width * 0.5 / size.width)
+      ..setFloat(offset + 3, rect.height * 0.5 / size.height);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final shader = _shader;
+    if (shader == null || !ui.ImageFilter.isShaderFilterSupported) {
+      return const SizedBox.shrink();
+    }
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final size = constraints.biggest;
+        if (!size.isEmpty && MakeupPainterUtils.valid(widget.landmarks)) {
+          final blushShapes = _colorMaterialShapes(
+            landmarks: widget.landmarks,
+            config: widget.blush,
+            renderContext: widget.renderContext,
+            part: MakeupPart.blush,
+          );
+          final eyeShapes = _colorMaterialShapes(
+            landmarks: widget.landmarks,
+            config: widget.eyeshadow,
+            renderContext: widget.renderContext,
+            part: MakeupPart.eyeshadow,
+          );
+          _writeShape(10, blushShapes.first, size);
+          _writeShape(14, blushShapes.second, size);
+          shader
+            ..setFloat(18, math.cos(-blushShapes.angle))
+            ..setFloat(19, math.sin(-blushShapes.angle));
+          _writeShape(30, eyeShapes.first, size);
+          _writeShape(34, eyeShapes.second, size);
+        }
+        return IgnorePointer(
+          child: ClipPath(
+            clipper: _FaceColorMaterialClipper(
+              landmarks: widget.landmarks,
+              blush: widget.blush,
+              eyeshadow: widget.eyeshadow,
+              renderContext: widget.renderContext,
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: BackdropFilter(
+              filter: ui.ImageFilter.shader(shader),
+              blendMode: BlendMode.srcOver,
+              child: const _FilterCoveragePaint(),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    _shader?.dispose();
+    super.dispose();
+  }
+}
+
+class _FaceColorMaterialClipper extends CustomClipper<Path> {
+  const _FaceColorMaterialClipper({
+    required this.landmarks,
+    required this.blush,
+    required this.eyeshadow,
+    required this.renderContext,
+  });
+
+  final List<Offset> landmarks;
+  final MakeupLayerConfig blush;
+  final MakeupLayerConfig eyeshadow;
+  final FaceRenderContext renderContext;
+
+  @override
+  Path getClip(Size size) {
+    final result = Path();
+    if (blush.enabled) {
+      result.addPath(
+        _ColorMaterialClipper(
+          landmarks: landmarks,
+          config: blush,
+          renderContext: renderContext,
+          part: MakeupPart.blush,
+        ).getClip(size),
+        Offset.zero,
+      );
+    }
+    if (eyeshadow.enabled) {
+      result.addPath(
+        _ColorMaterialClipper(
+          landmarks: landmarks,
+          config: eyeshadow,
+          renderContext: renderContext,
+          part: MakeupPart.eyeshadow,
+        ).getClip(size),
+        Offset.zero,
+      );
+    }
+    return result;
+  }
+
+  @override
+  bool shouldReclip(_FaceColorMaterialClipper oldClipper) =>
+      oldClipper.landmarks != landmarks ||
+      oldClipper.blush != blush ||
+      oldClipper.eyeshadow != eyeshadow ||
+      oldClipper.renderContext != renderContext;
+}
+
+class _ColorMaterialClipper extends CustomClipper<Path> {
+  const _ColorMaterialClipper({
+    required this.landmarks,
+    required this.config,
+    required this.renderContext,
+    required this.part,
+  });
+
+  final List<Offset> landmarks;
+  final MakeupLayerConfig config;
+  final FaceRenderContext renderContext;
+  final MakeupPart part;
+
+  @override
+  Path getClip(Size size) {
+    if (!MakeupPainterUtils.valid(landmarks)) return Path();
+    return switch (part) {
+      MakeupPart.blush => _blushPath(),
+      MakeupPart.eyeshadow => _eyeshadowPath(),
+      _ => Path(),
+    };
+  }
+
+  Path _blushPath() {
+    final result = Path();
+    final shapes = _colorMaterialShapes(
+      landmarks: landmarks,
+      config: config,
+      renderContext: renderContext,
+      part: MakeupPart.blush,
+    );
+    for (final rect in <Rect>[shapes.first, shapes.second]) {
+      final oval = Path()..addOval(rect);
+      final transform = Matrix4.identity()
+        ..translateByDouble(rect.center.dx, rect.center.dy, 0, 1)
+        ..rotateZ(shapes.angle)
+        ..translateByDouble(-rect.center.dx, -rect.center.dy, 0, 1);
+      result.addPath(oval.transform(transform.storage), Offset.zero);
+    }
+    return result;
+  }
+
+  Path _eyeshadowPath() {
+    final result = Path();
+    for (final (indices, sideA) in <(List<int>, bool)>[
+      (MakeupPainterUtils.leftEyeUpper, true),
+      (MakeupPainterUtils.rightEyeUpper, false),
+    ]) {
+      final points = indices.map((index) => landmarks[index]).toList();
+      final axis = points.last - points.first;
+      var normal = Offset(-axis.dy, axis.dx) / math.max(axis.distance, 0.001);
+      if (normal.dy > 0) normal = -normal;
+      final blinkStability =
+          0.62 + renderContext.eyeOpennessForSide(sideA: sideA) * 0.38;
+      final lift =
+          axis.distance * (0.2 + config.detail * 0.14) * blinkStability;
+      result.addPath(
+        MakeupPainterUtils.smoothClosedOffsets(<Offset>[
+          ...points,
+          ...points.reversed.map((point) => point + normal * lift),
+        ]),
+        Offset.zero,
+      );
+    }
+    return result;
+  }
+
+  @override
+  bool shouldReclip(_ColorMaterialClipper oldClipper) =>
+      oldClipper.landmarks != landmarks ||
+      oldClipper.config != config ||
+      oldClipper.renderContext != renderContext ||
+      oldClipper.part != part;
+}
+
 class _LipMaterialLayer extends StatefulWidget {
   const _LipMaterialLayer({
     required this.landmarks,
@@ -1625,7 +2269,9 @@ class _LipMaterialLayerState extends State<_LipMaterialLayer> {
         LipFinish.velvet => 0,
         LipFinish.satin => 0.48,
         LipFinish.glass => 1,
-      });
+      })
+      ..setFloat(7, widget.config.detail)
+      ..setFloat(8, widget.renderContext.mouthOpenness);
   }
 
   @override
@@ -1805,11 +2451,17 @@ class _TrackingPerformance {
     this.fps = 0,
     this.inferenceMs = 0,
     this.pipelineLatencyMs = 0,
+    this.nativeGpuMs = 0,
+    this.rasterFrameMs = 0,
+    this.thermalPressure = 0,
     this.tracking = false,
   });
 
   final double fps;
   final double inferenceMs;
   final double pipelineLatencyMs;
+  final double nativeGpuMs;
+  final double rasterFrameMs;
+  final double thermalPressure;
   final bool tracking;
 }

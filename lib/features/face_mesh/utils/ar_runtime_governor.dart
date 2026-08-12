@@ -25,6 +25,7 @@ abstract final class ArRuntimeGovernor {
     required double faceFps,
     required double faceInferenceMs,
     required double occlusionInferenceMs,
+    double thermalPressure = 0,
   }) {
     var milliseconds = switch (faceFps) {
       >= 27 => 45.0,
@@ -38,6 +39,8 @@ abstract final class ArRuntimeGovernor {
     if (occlusionInferenceMs > 260) {
       milliseconds += math.min(180, (occlusionInferenceMs - 260) * 0.6);
     }
+    if (thermalPressure > 0.5) milliseconds += 150;
+    if (thermalPressure > 0.85) milliseconds += 300;
     return Duration(milliseconds: milliseconds.round());
   }
 
@@ -46,6 +49,9 @@ abstract final class ArRuntimeGovernor {
   static double renderDetailQuality({
     required double faceFps,
     required double faceInferenceMs,
+    double gpuRenderMs = 0,
+    double rasterFrameMs = 0,
+    double thermalPressure = 0,
   }) {
     if (faceFps <= 0) return 1;
     var quality = switch (faceFps) {
@@ -56,6 +62,14 @@ abstract final class ArRuntimeGovernor {
       _ => 0.44,
     };
     if (faceInferenceMs > 46) quality -= 0.08;
+    if (gpuRenderMs > 12) quality -= 0.08;
+    if (gpuRenderMs > 18) quality -= 0.14;
+    // RuntimeEffect/BackdropFilter 的成本发生在 Flutter raster 线程，原生
+    // renderer 的计时看不到它；单独纳入分档才能避免低端机滤镜堆积卡顿。
+    if (rasterFrameMs > 11) quality -= 0.08;
+    if (rasterFrameMs > 17) quality -= 0.16;
+    if (thermalPressure > 0.5) quality -= 0.12;
+    if (thermalPressure > 0.85) quality -= 0.22;
     return quality.clamp(0.4, 1).toDouble();
   }
 }

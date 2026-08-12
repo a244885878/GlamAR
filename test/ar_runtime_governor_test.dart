@@ -51,4 +51,37 @@ void main() {
       1,
     );
   });
+
+  test('accounts for native and Flutter raster GPU pressure separately', () {
+    final nativePressure = ArRuntimeGovernor.renderDetailQuality(
+      faceFps: 28,
+      faceInferenceMs: 25,
+      gpuRenderMs: 20,
+    );
+    final filterPressure = ArRuntimeGovernor.renderDetailQuality(
+      faceFps: 28,
+      faceInferenceMs: 25,
+      rasterFrameMs: 20,
+    );
+
+    expect(nativePressure, lessThan(1));
+    expect(filterPressure, lessThan(1));
+  });
+
+  test('backs off optional work before sustained thermal throttling', () {
+    final quality = ArRuntimeGovernor.renderDetailQuality(
+      faceFps: 28,
+      faceInferenceMs: 25,
+      thermalPressure: 1,
+    );
+    final cooldown = ArRuntimeGovernor.occlusionCooldown(
+      faceFps: 28,
+      faceInferenceMs: 25,
+      occlusionInferenceMs: 180,
+      thermalPressure: 1,
+    );
+
+    expect(quality, lessThan(0.7));
+    expect(cooldown, greaterThan(const Duration(milliseconds: 400)));
+  });
 }
